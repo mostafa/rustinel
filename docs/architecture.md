@@ -100,18 +100,19 @@ Thread-safe caches for performance:
 - Parses YAML rules with boolean logic
 - Skips unsupported rules at load time (`category`, `product`, `service`)
 - Evaluates only rules in relevant category buckets per event
-- Precompiles condition trees at startup
+- Precompiles condition trees at startup and on hot reload swaps
 - Supports core Sigma modifiers like `contains`, `re`, `cidr`, `base64`, `fieldref`, `windash`
 - Evaluates in real-time per event
 
 **YARA Scanner:**
-- Compiles rules at startup
+- Compiles rules at startup and on hot reload swaps
 - Background worker for non-blocking scans
 - Triggers on process creation events
 - Skips allowlisted path prefixes before queueing and in the worker
 
 **IOC Engine:**
 - Matches atomic indicators: hashes (MD5/SHA1/SHA256), IPs/CIDRs, domains (exact + suffix), path regexes
+- Reloads IOC files at runtime with atomic engine swaps
 - Domain, IP, and path checks run inline (negligible overhead with small indicator sets)
 - Hash computation runs in a dedicated `spawn_blocking` worker thread
 - Hash allowlist uses shared `allowlist.paths` by default (or `ioc.hash_allowlist_paths` override)

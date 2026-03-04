@@ -36,6 +36,13 @@ cargo build --release
 2. Trigger a Sigma example by running `whoami /all`.
 3. Confirm an alert exists in `logs\alerts.json.YYYY-MM-DD`.
 
+## Verify Hot Reload (Optional)
+
+1. Keep Rustinel running in one terminal.
+2. In another elevated terminal, append a harmless comment to a rule file, for example:
+   `Add-Content rules\sigma\example_whoami.yml "`n# hot reload smoke test"`
+3. Wait a few seconds and confirm the runtime log reports `Sigma rules hot-reloaded`.
+
 ## Run as a Service (Optional)
 
 Service commands must be run from the final install directory. The service uses

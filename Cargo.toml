@@ -47,6 +47,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 tracing-appender = "0.2"
 clap = { version = "4.4", features = ["derive"] }
+arc-swap = "1.7"
 
 # Configuration
 config = "0.15.19"

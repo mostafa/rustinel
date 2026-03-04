@@ -5,10 +5,9 @@
 
 use crate::alerts::AlertSink;
 use crate::collector::EventHandler;
-use crate::engine::Engine;
-use crate::ioc::IocEngine;
 use crate::models::EventCategory;
 use crate::normalizer::Normalizer;
+use crate::reload::DetectorStore;
 use crate::response::ResponseEngine;
 use ferrisetw::EventRecord;
 use std::sync::Arc;
@@ -22,10 +21,8 @@ const TARGET_ENGINE: &str = "engine";
 pub struct SigmaDetectionHandler {
     /// Normalizer for converting ETW events to Sysmon-compatible format
     pub normalizer: Arc<Normalizer>,
-    /// Sigma detection engine
-    pub engine: Arc<Engine>,
-    /// IOC detection engine (optional)
-    pub ioc_engine: Option<Arc<IocEngine>>,
+    /// Live detector store (sigma/ioc hot-reloaded atomically)
+    pub detectors: Arc<DetectorStore>,
     /// Hash worker channel (optional)
     pub ioc_hash_tx: Option<mpsc::Sender<(String, u32)>>,
     /// ECS NDJSON alert sink
@@ -86,8 +83,9 @@ impl EventHandler for SigmaDetectionHandler {
                     }
                 }
 
-                // Check against Sigma rules
-                if let Some(mut alert) = self.engine.check_event(&normalized_event) {
+                // Check against Sigma rules (live engine snapshot)
+                let sigma = self.detectors.sigma();
+                if let Some(mut alert) = sigma.check_event(&normalized_event) {
                     self.normalizer
                         .enrich_process_context(&mut alert.event, record.process_id());
 
@@ -110,24 +108,23 @@ impl EventHandler for SigmaDetectionHandler {
                     tracing::trace!(target: TARGET_ENGINE, "No Sigma rule matched this event");
                 }
 
-                // Check against IOC rules
-                if let Some(ioc_engine) = &self.ioc_engine {
-                    let ioc_matches = ioc_engine.check_event(&normalized_event);
-                    if !ioc_matches.is_empty() {
-                        for m in ioc_matches {
-                            let mut alert = ioc_engine.build_alert_for_match(&m, &normalized_event);
-                            self.normalizer
-                                .enrich_process_context(&mut alert.event, record.process_id());
-                            info!(
-                                target: TARGET_ENGINE,
-                                rule = %alert.rule_name,
-                                severity = ?alert.severity,
-                                category = ?alert.event.category,
-                                "IOC detection triggered"
-                            );
-                            self.alert_sink.write_alert(&alert);
-                            self.response_engine.handle_alert(&alert);
-                        }
+                // Check against IOC rules (live engine snapshot)
+                let ioc_engine = self.detectors.ioc();
+                let ioc_matches = ioc_engine.check_event(&normalized_event);
+                if !ioc_matches.is_empty() {
+                    for m in ioc_matches {
+                        let mut alert = ioc_engine.build_alert_for_match(&m, &normalized_event);
+                        self.normalizer
+                            .enrich_process_context(&mut alert.event, record.process_id());
+                        info!(
+                            target: TARGET_ENGINE,
+                            rule = %alert.rule_name,
+                            severity = ?alert.severity,
+                            category = ?alert.event.category,
+                            "IOC detection triggered"
+                        );
+                        self.alert_sink.write_alert(&alert);
+                        self.response_engine.handle_alert(&alert);
                     }
                 }
             }

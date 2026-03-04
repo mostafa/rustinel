@@ -10,6 +10,7 @@ mod engine;
 mod ioc;
 mod models;
 mod normalizer;
+mod reload;
 mod response;
 mod scanner;
 mod state;
@@ -20,12 +21,13 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use collector::{Collector, EventRouter};
 use engine::{Engine, SigmaDetectionHandler};
-use ioc::{HashCache, IocEngine};
+use ioc::{HashCache, HashRequirements, IocEngine};
 use models::{
     Alert, AlertSeverity, DetectionEngine, EventCategory, EventFields, MatchDebugLevel,
     MatchDetails, NormalizedEvent, ProcessCreationFields, YaraMatchDetails, YaraRuleMatch,
 };
 use normalizer::Normalizer;
+use reload::DetectorStore;
 use response::ResponseEngine;
 use scanner::YaraEventHandler;
 use state::{ConnectionAggregator, DnsCache, ProcessCache, SidCache};
@@ -897,8 +899,61 @@ async fn run_edr(
     // Buffer = 1000 items. If 1000 processes start instantly, we drop events rather than blocking.
     let (tx, mut rx) = mpsc::channel::<(String, u32)>(1000);
 
+    // Initialize IOC engine
+    let ioc_engine = Arc::new(IocEngine::load(&cfg.ioc));
+    if ioc_engine.is_enabled() {
+        let stats = ioc_engine.stats();
+        info!(
+            target: "rustinel",
+            md5 = stats.md5,
+            sha1 = stats.sha1,
+            sha256 = stats.sha256,
+            ip = stats.ip,
+            cidr = stats.cidr,
+            domain_exact = stats.domain_exact,
+            domain_suffix = stats.domain_suffix,
+            path_regex = stats.path_regex,
+            "IOC engine initialized"
+        );
+    } else {
+        info!(target: "rustinel", "IOC detection disabled by configuration");
+    }
+
+    let detectors = DetectorStore::new(
+        Arc::clone(&sigma_engine),
+        Arc::clone(&yara_scanner),
+        Arc::clone(&ioc_engine),
+    );
+
+    let mut reload_poller_handle = None;
+    let mut reload_worker_handle = None;
+    let mut reload_tx = None;
+    if cfg.reload.enabled {
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        reload_worker_handle = Some(reload::spawn_reload_worker(
+            Arc::clone(&detectors),
+            cfg.scanner.clone(),
+            cfg.ioc.clone(),
+            cfg.reload.clone(),
+            cfg.logging.level.clone(),
+            cfg.alerts.match_debug,
+            rx,
+        ));
+
+        reload_poller_handle = Some(reload::spawn_reload_poller(
+            cfg.scanner.clone(),
+            cfg.ioc.clone(),
+            cfg.reload.clone(),
+            tx.clone(),
+        ));
+        reload_tx = Some(tx);
+    } else {
+        info!(target: "reload", "Hot-reload disabled by configuration");
+    }
+
     // Spawn the background worker task for YARA scanning
-    let scanner_clone = Arc::clone(&yara_scanner);
+    let detectors_for_yara = Arc::clone(&detectors);
     let yara_allowlist_paths_for_worker = yara_allowlist_paths.clone();
     let alert_sink_for_yara = alert_sink.clone();
     let response_engine_for_yara = response_engine.clone();
@@ -928,7 +983,8 @@ async fn run_edr(
                 "YARA worker received file for scan"
             );
 
-            match scanner_clone.scan_file(&path, match_debug) {
+            let scanner = detectors_for_yara.yara();
+            match scanner.scan_file(&path, match_debug) {
                 Ok(matches) => {
                     if !matches.is_empty() {
                         let rule_names: Vec<String> =
@@ -976,40 +1032,12 @@ async fn run_edr(
         info!(target: "scanner", "YARA worker thread shutting down");
     });
 
-    // Initialize IOC engine
-    let ioc_engine = Arc::new(IocEngine::load(&cfg.ioc));
-    if ioc_engine.is_enabled() {
-        let stats = ioc_engine.stats();
-        info!(
-            target: "rustinel",
-            md5 = stats.md5,
-            sha1 = stats.sha1,
-            sha256 = stats.sha256,
-            ip = stats.ip,
-            cidr = stats.cidr,
-            domain_exact = stats.domain_exact,
-            domain_suffix = stats.domain_suffix,
-            path_regex = stats.path_regex,
-            "IOC engine initialized"
-        );
-    } else {
-        info!(target: "rustinel", "IOC detection disabled by configuration");
-    }
-
-    let ioc_engine_for_handler = if ioc_engine.is_enabled() {
-        Some(Arc::clone(&ioc_engine))
-    } else {
-        None
-    };
-
     // Create background worker channel for IOC hashing (process start only)
     // Uses spawn_blocking to avoid starving the tokio async thread pool with
     // CPU-bound crypto work and synchronous file I/O.
-    let (ioc_hash_tx, mut ioc_hash_worker_handle) = if ioc_engine.is_enabled()
-        && ioc_engine.wants_hashing()
-    {
+    let (ioc_hash_tx, mut ioc_hash_worker_handle) = if ioc_engine.is_enabled() {
         let (hash_tx, mut hash_rx) = mpsc::channel::<(String, u32)>(1000);
-        let ioc_engine_for_hash = Arc::clone(&ioc_engine);
+        let detectors_for_ioc_hash = Arc::clone(&detectors);
         let alert_sink_for_ioc = alert_sink.clone();
         let response_engine_for_ioc = response_engine.clone();
 
@@ -1018,10 +1046,13 @@ async fn run_edr(
                 target: "ioc",
                 "IOC hash worker thread started and waiting for files to hash"
             );
-            let requirements = ioc_engine_for_hash.hash_requirements();
-            let max_file_size = ioc_engine_for_hash.max_file_size_bytes();
             let mut cache = HashCache::new();
             let mut buf = vec![0u8; 64 * 1024];
+            let mut last_requirements = HashRequirements {
+                md5: false,
+                sha1: false,
+                sha256: false,
+            };
             let mut hash_error_limiter =
                 LogRateLimiter::new(Duration::from_secs(WORKER_DEBUG_LOG_WINDOW_SECS));
 
@@ -1030,8 +1061,28 @@ async fn run_edr(
                     continue;
                 }
 
+                let ioc_engine = detectors_for_ioc_hash.ioc();
+                if !ioc_engine.is_enabled() || !ioc_engine.wants_hashing() {
+                    continue;
+                }
+
+                let requirements = ioc_engine.hash_requirements();
+                if requirements != last_requirements {
+                    cache = HashCache::new();
+                    last_requirements = requirements;
+                    info!(
+                        target: "ioc",
+                        md5 = requirements.md5,
+                        sha1 = requirements.sha1,
+                        sha256 = requirements.sha256,
+                        "IOC hash requirements changed; cache reset"
+                    );
+                }
+
+                let max_file_size = ioc_engine.max_file_size_bytes();
+
                 // Skip allowlisted paths (trusted directories)
-                if ioc_engine_for_hash.is_hash_allowlisted(&path) {
+                if ioc_engine.is_hash_allowlisted(&path) {
                     tracing::trace!(
                         target: "ioc",
                         pid = pid,
@@ -1076,7 +1127,7 @@ async fn run_edr(
                     }
                 };
 
-                let matches = ioc_engine_for_hash.match_hashes(&hashes);
+                let matches = ioc_engine.match_hashes(&hashes);
                 if !matches.is_empty() {
                     info!(
                         pid = pid,
@@ -1085,7 +1136,7 @@ async fn run_edr(
                         "IOC hash match detected"
                     );
                     for m in matches {
-                        let alert = ioc_engine_for_hash.build_alert_for_hash_match(&m, &path, pid);
+                        let alert = ioc_engine.build_alert_for_hash_match(&m, &path, pid);
                         alert_sink_for_ioc.write_alert(&alert);
                         response_engine_for_ioc.handle_alert(&alert);
                     }
@@ -1121,8 +1172,7 @@ async fn run_edr(
     // Create Sigma detection handler
     let sigma_handler = SigmaDetectionHandler {
         normalizer: Arc::clone(&normalizer),
-        engine: Arc::clone(&sigma_engine),
-        ioc_engine: ioc_engine_for_handler,
+        detectors: Arc::clone(&detectors),
         ioc_hash_tx,
         alert_sink: alert_sink.clone(),
         response_engine: response_engine.clone(),
@@ -1210,6 +1260,21 @@ async fn run_edr(
                 }
             }
 
+            if let Some(handle) = reload_poller_handle.take() {
+                info!("Signaling hot-reload poller to shut down...");
+                handle.abort();
+                let _ = handle.await;
+                info!("Hot-reload poller thread finished");
+            }
+            drop(reload_tx.take());
+            if let Some(handle) = reload_worker_handle.take() {
+                info!("Signaling hot-reload worker to shut down...");
+                match handle.await {
+                    Ok(_) => info!("Hot-reload worker thread finished"),
+                    Err(e) => error!("Failed to join hot-reload worker thread: {}", e),
+                }
+            }
+
             info!("Signaling response worker to shut down...");
             match response_worker_handle.await {
                 Ok(_) => info!("Response worker thread finished"),
@@ -1237,6 +1302,21 @@ async fn run_edr(
                     match handle.await {
                         Ok(_) => info!("IOC hash worker thread finished"),
                         Err(e) => error!("Failed to join IOC hash worker thread: {}", e),
+                    }
+                }
+
+                if let Some(handle) = reload_poller_handle.take() {
+                    info!("Signaling hot-reload poller to shut down...");
+                    handle.abort();
+                    let _ = handle.await;
+                    info!("Hot-reload poller thread finished");
+                }
+                drop(reload_tx.take());
+                if let Some(handle) = reload_worker_handle.take() {
+                    info!("Signaling hot-reload worker to shut down...");
+                    match handle.await {
+                        Ok(_) => info!("Hot-reload worker thread finished"),
+                        Err(e) => error!("Failed to join hot-reload worker thread: {}", e),
                     }
                 }
 

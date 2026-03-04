@@ -24,6 +24,10 @@ sigma_rules_path = "rules/sigma"
 yara_enabled = true
 yara_rules_path = "rules/yara"
 
+[reload]
+enabled = true
+debounce_ms = 2000
+
 [allowlist]
 paths = [
   "C:\\Windows\\",
@@ -76,6 +80,17 @@ max_file_size_mb = 50
 | `yara_enabled` | `true` | Enable YARA scanner |
 | `yara_rules_path` | `rules/yara` | Path to YARA rules directory (relative to working directory unless absolute) |
 | `yara_allowlist_paths` | inherits `allowlist.paths` | Prefix paths skipped by YARA scan queue/worker (case-insensitive). Optional module-specific override |
+
+### Hot Reload
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `enabled` | `true` | Enable local file-based hot reload for Sigma, YARA, and IOC inputs |
+| `debounce_ms` | `2000` | Debounce window for coalescing burst filesystem events before rebuild/swap |
+
+Behavior notes:
+- The poll cadence is `max(reload.debounce_ms, 2000ms)`.
+- Empty reload results are rejected for safety (existing Sigma/YARA/IOC engines stay active).
 
 ### Global Allowlist
 
@@ -159,6 +174,7 @@ $env:EDR__LOGGING__LEVEL="debug"
 $env:EDR__LOGGING__FILTER="info,engine=debug,scanner=info,ioc=debug,rustinel::normalizer=info"
 $env:EDR__SCANNER__SIGMA_RULES_PATH="C:\\custom\\sigma"
 $env:EDR__SCANNER__YARA_RULES_PATH="C:\\custom\\yara"
+$env:EDR__RELOAD__DEBOUNCE_MS=2000
 $env:EDR__ALLOWLIST__PATHS='["C:\\Windows\\","C:\\Program Files\\"]'
 # optional module-specific override:
 $env:EDR__SCANNER__YARA_ALLOWLIST_PATHS='["C:\\Windows\\","D:\\Trusted\\"]'

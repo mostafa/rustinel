@@ -2,7 +2,8 @@
 
 Rustinel is a high-performance, user-mode Windows EDR agent written in Rust. It collects
 kernel telemetry via ETW, normalizes to Sysmon-style fields, runs Sigma, YARA, and
-atomic IOC detection, and writes ECS 9.3.0 NDJSON alerts (non-ECS fields use the `edr.` prefix).
+atomic IOC detection, supports local hot reload of rule/IOC files, and writes ECS 9.3.0
+NDJSON alerts (non-ECS fields use the `edr.` prefix).
 
 ## Start Here
 
@@ -20,6 +21,7 @@ atomic IOC detection, and writes ECS 9.3.0 NDJSON alerts (non-ECS fields use the
 
 - [Architecture](architecture.md)
 - [Development](development.md)
+- [Enterprise Agent Plan (MVP)](enterprise-agent-plan.md)
 - [Roadmap](roadmap.md)
 
 ## Quick Start (60 seconds)
@@ -35,3 +37,4 @@ atomic IOC detection, and writes ECS 9.3.0 NDJSON alerts (non-ECS fields use the
 - Configuration and rules are resolved from the current working directory. For service mode, use absolute paths or environment overrides.
 - Service mode is supported on Windows. See the CLI Reference for commands.
 - Trusted path allowlisting is shared by default across Response, IOC hash, and YARA (`allowlist.paths`).
+- Local hot reload is enabled by default; see Configuration for `reload.*` settings.

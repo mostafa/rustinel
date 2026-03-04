@@ -54,7 +54,7 @@ level: high
 - Boolean operators: `and`, `or`, `not`
 - Parentheses for grouping
 - Aggregation: `1 of selection*`, `all of them`
-- Conditions are transpiled and precompiled at startup (no parsing in the hot event path)
+- Conditions are transpiled and precompiled at startup and on hot reload (no parsing in the hot event path)
 
 ### Supported Modifiers
 
@@ -153,7 +153,7 @@ rule ExampleDetection {
 
 ### Behavior
 
-- Rules loaded from `rules/yara/` at startup
+- Rules loaded from `rules/yara/` at startup and hot-reloaded on file changes
 - Scans triggered on process creation events
 - File scanning runs in background (non-blocking)
 - Files under allowlisted path prefixes are skipped before queueing and again in the worker
@@ -167,6 +167,7 @@ rule ExampleDetection {
 ## Atomic IOC Detection
 
 The IOC engine matches atomic indicators against live events. It supports four indicator types.
+IOC files are loaded at startup and hot-reloaded on file changes.
 
 ### Hash IOCs (`rules/ioc/hashes.txt`)
 

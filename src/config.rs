@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use crate::models::MatchDebugLevel;
 
 /// Main application configuration
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub scanner: ScannerConfig,
     pub logging: LogConfig,
@@ -25,10 +25,11 @@ pub struct AppConfig {
     pub response: ResponseConfig,
     pub network: NetworkConfig,
     pub ioc: IocConfig,
+    pub reload: ReloadConfig,
 }
 
 /// Scanner configuration (Sigma and YARA rules)
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ScannerConfig {
     pub sigma_enabled: bool,
     pub sigma_rules_path: PathBuf,
@@ -38,14 +39,14 @@ pub struct ScannerConfig {
 }
 
 /// Global allowlist configuration shared across modules
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AllowlistConfig {
     /// Trusted directory prefixes, applied to response/IOC hash/YARA scan
     pub paths: Vec<String>,
 }
 
 /// Operational logging configuration (application debug logs)
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct LogConfig {
     pub level: String,
     /// Optional tracing filter expression. If set, overrides `level`.
@@ -56,7 +57,7 @@ pub struct LogConfig {
 }
 
 /// Security alerts configuration (JSON output for SIEM)
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AlertConfig {
     pub directory: PathBuf,
     pub filename: String,
@@ -64,7 +65,7 @@ pub struct AlertConfig {
 }
 
 /// Active response configuration (optional prevention/termination)
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ResponseConfig {
     pub enabled: bool,
     pub prevention_enabled: bool,
@@ -75,7 +76,7 @@ pub struct ResponseConfig {
 }
 
 /// Network event aggregation configuration
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct NetworkConfig {
     /// Enable connection aggregation to reduce event volume
     pub aggregation_enabled: bool,
@@ -86,7 +87,7 @@ pub struct NetworkConfig {
 }
 
 /// Atomic IOC detection configuration
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct IocConfig {
     pub enabled: bool,
     pub hashes_path: PathBuf,
@@ -96,6 +97,13 @@ pub struct IocConfig {
     pub default_severity: String,
     pub max_file_size_mb: u64,
     pub hash_allowlist_paths: Vec<String>,
+}
+
+/// Rule hot-reload configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReloadConfig {
+    pub enabled: bool,
+    pub debounce_ms: u64,
 }
 
 impl AppConfig {
@@ -147,6 +155,9 @@ impl AppConfig {
             .set_default("ioc.default_severity", "high")?
             .set_default("ioc.max_file_size_mb", 50)?
             .set_default("ioc.hash_allowlist_paths", Vec::<String>::new())?
+            // Hot Reload
+            .set_default("reload.enabled", true)?
+            .set_default("reload.debounce_ms", 2000)?
             // --- Sources ---
             .add_source(config::File::with_name("config").required(false))
             .add_source(config::Environment::with_prefix("EDR").separator("__"))
@@ -224,6 +235,10 @@ impl Default for AppConfig {
                 max_file_size_mb: 50,
                 hash_allowlist_paths: Vec::new(),
             },
+            reload: ReloadConfig {
+                enabled: true,
+                debounce_ms: 2000,
+            },
         };
 
         cfg.apply_allowlist_fallbacks();
@@ -247,6 +262,8 @@ mod tests {
         assert_eq!(cfg.response.min_severity, "critical");
         assert!(cfg.ioc.enabled);
         assert_eq!(cfg.ioc.default_severity, "high");
+        assert!(cfg.reload.enabled);
+        assert_eq!(cfg.reload.debounce_ms, 2000);
         assert_eq!(cfg.alerts.match_debug, MatchDebugLevel::Off);
     }
 

@@ -5,8 +5,11 @@
 use anyhow::{Context, Result};
 use ferrisetw::parser::Parser;
 use ferrisetw::EventRecord;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, info, warn};
 use yara_x::{Compiler, Rules, Scanner as XScanner};
@@ -46,6 +49,110 @@ pub fn is_path_allowlisted(path: &str, allowlist_paths: &[String]) -> bool {
 
 const MAX_YARA_STRINGS_PER_RULE: usize = 8;
 const MAX_YARA_SNIPPET_LEN: usize = 80;
+const YARA_CACHE_MAX_ENTRIES: usize = 10_000;
+const YARA_CACHE_TTL_SECS: u64 = 6 * 60 * 60;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct YaraFileIdentity {
+    path: String,
+    size: u64,
+    mtime_nanos: u128,
+}
+
+#[derive(Debug, Clone)]
+struct YaraCacheEntry {
+    matches: Vec<YaraRuleMatch>,
+    timestamp: u64,
+}
+
+#[derive(Debug)]
+struct YaraScanCache {
+    entries: HashMap<YaraFileIdentity, YaraCacheEntry>,
+    max_entries: usize,
+    ttl_secs: u64,
+}
+
+impl YaraScanCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_entries: YARA_CACHE_MAX_ENTRIES,
+            ttl_secs: YARA_CACHE_TTL_SECS,
+        }
+    }
+
+    fn get(&mut self, identity: &YaraFileIdentity) -> Option<Vec<YaraRuleMatch>> {
+        let entry = self.entries.get(identity)?;
+        if self.is_expired(entry) {
+            self.entries.remove(identity);
+            return None;
+        }
+
+        Some(entry.matches.clone())
+    }
+
+    fn insert(&mut self, identity: YaraFileIdentity, matches: Vec<YaraRuleMatch>) {
+        let now = now_secs();
+        self.entries.insert(
+            identity,
+            YaraCacheEntry {
+                matches,
+                timestamp: now,
+            },
+        );
+
+        if self.entries.len() > self.max_entries {
+            self.trim();
+        }
+    }
+
+    fn is_expired(&self, entry: &YaraCacheEntry) -> bool {
+        now_secs().saturating_sub(entry.timestamp) > self.ttl_secs
+    }
+
+    fn trim(&mut self) {
+        if self.entries.len() <= self.max_entries {
+            return;
+        }
+
+        let mut timestamps: Vec<u64> = self.entries.values().map(|entry| entry.timestamp).collect();
+        timestamps.sort_unstable();
+        let cutoff = timestamps[self.entries.len() / 2];
+        self.entries.retain(|_, entry| entry.timestamp >= cutoff);
+
+        if self.entries.len() > self.max_entries {
+            let extra = self.entries.len() - self.max_entries;
+            let keys: Vec<YaraFileIdentity> = self.entries.keys().take(extra).cloned().collect();
+            for key in keys {
+                self.entries.remove(&key);
+            }
+        }
+    }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn yara_file_identity(path: &str) -> Option<YaraFileIdentity> {
+    let metadata = fs::metadata(path).ok()?;
+    let size = metadata.len();
+    let mtime_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+
+    Some(YaraFileIdentity {
+        path: path.replace('/', "\\").to_ascii_lowercase(),
+        size,
+        mtime_nanos,
+    })
+}
 
 fn truncate_str(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
@@ -73,6 +180,8 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 /// Main Scanner struct holding compiled rules
 pub struct Scanner {
     rules: Rules,
+    compiled_files: usize,
+    cache: Mutex<YaraScanCache>,
 }
 
 impl Scanner {
@@ -120,7 +229,15 @@ impl Scanner {
             "YARA Scanner: Found {} rule files, compiled {} successfully",
             files_found, files_compiled
         );
-        Ok(Self { rules })
+        Ok(Self {
+            rules,
+            compiled_files: files_compiled,
+            cache: Mutex::new(YaraScanCache::new()),
+        })
+    }
+
+    pub fn compiled_files(&self) -> usize {
+        self.compiled_files
     }
 
     /// Scan a file path and return matching rule details
@@ -129,12 +246,29 @@ impl Scanner {
         path: &str,
         match_debug: MatchDebugLevel,
     ) -> Result<Vec<YaraRuleMatch>> {
+        let identity = yara_file_identity(path);
+        if let Some(identity) = identity.as_ref() {
+            if let Ok(mut cache) = self.cache.lock() {
+                if let Some(cached_matches) = cache.get(identity) {
+                    tracing::trace!(
+                        target: "scanner",
+                        file = %path,
+                        matches = cached_matches.len(),
+                        "YARA cache hit"
+                    );
+                    return Ok(cached_matches);
+                }
+            }
+        }
+
         let mut matches = Vec::new();
+        let mut scan_ok = false;
         let mut scanner = XScanner::new(&self.rules);
 
         // Scan the file
         match scanner.scan_file(path) {
             Ok(scan_results) => {
+                scan_ok = true;
                 for rule in scan_results.matching_rules() {
                     let rule_name = rule.identifier().to_string();
                     let include_meta = !matches!(match_debug, MatchDebugLevel::Off);
@@ -197,6 +331,14 @@ impl Scanner {
                     error = %e,
                     "Skipping YARA scan"
                 );
+            }
+        }
+
+        if scan_ok {
+            if let Some(identity) = identity {
+                if let Ok(mut cache) = self.cache.lock() {
+                    cache.insert(identity, matches.clone());
+                }
             }
         }
 
@@ -351,5 +493,54 @@ mod tests {
             &allowlist
         ));
         assert!(!is_path_allowlisted(r"C:\Temp\evil.exe", &allowlist));
+    }
+
+    #[test]
+    fn test_yara_scan_cache_returns_cached_matches() {
+        let mut cache = YaraScanCache {
+            entries: HashMap::new(),
+            max_entries: 10,
+            ttl_secs: 60,
+        };
+        let identity = YaraFileIdentity {
+            path: r"c:\temp\sample.exe".to_string(),
+            size: 1337,
+            mtime_nanos: 42,
+        };
+        let expected = vec![YaraRuleMatch {
+            rule: "TestRule".to_string(),
+            tags: Vec::new(),
+            namespace: None,
+            strings: Vec::new(),
+        }];
+
+        cache.insert(identity.clone(), expected.clone());
+        let from_cache = cache.get(&identity);
+
+        let cached = from_cache.expect("expected cache hit");
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].rule, expected[0].rule);
+    }
+
+    #[test]
+    fn test_yara_scan_cache_miss_on_identity_change() {
+        let mut cache = YaraScanCache {
+            entries: HashMap::new(),
+            max_entries: 10,
+            ttl_secs: 60,
+        };
+        let identity = YaraFileIdentity {
+            path: r"c:\temp\sample.exe".to_string(),
+            size: 1337,
+            mtime_nanos: 42,
+        };
+        let updated = YaraFileIdentity {
+            path: r"c:\temp\sample.exe".to_string(),
+            size: 2048,
+            mtime_nanos: 43,
+        };
+
+        cache.insert(identity, Vec::new());
+        assert!(cache.get(&updated).is_none());
     }
 }

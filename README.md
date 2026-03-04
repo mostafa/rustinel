@@ -13,7 +13,8 @@ Rustinel is a **high-throughput Windows EDR agent** written in **Rust**. It coll
 
 > ✅ No kernel driver  
 > ✅ User-mode ETW pipeline  
-> ✅ Sigma behavioral detection + YARA scanning  
+> ✅ Sigma behavioral detection + YARA scanning + IOCs detection
+> ✅ Local hot reload for Sigma/YARA/IOC files  
 > ✅ ECS NDJSON alerts + operational logs
 
 <p align="center">
@@ -39,6 +40,7 @@ Rustinel monitors Windows endpoints by:
 - Normalizing ETW events into **Sysmon-compatible** fields
 - Detecting threats using **Sigma rules** and **YARA scanning**
 - Detecting **atomic IOCs** (hashes, IP/CIDR, domains, path regex)
+- Hot-reloading local Sigma/YARA/IOC files without process restart
 - Writing alerts in **ECS NDJSON** format
 
 ---
@@ -50,13 +52,14 @@ Rustinel monitors Windows endpoints by:
   - **Sigma** for behavioral detection
   - **YARA** for file scanning on process start
 - **Atomic IOC detection**: hashes, IP/CIDR, domains, path regex
+- **Local hot reload**: Sigma, YARA, and IOC files are reloaded in-place with atomic swaps
 - **Noise reduction**:
   - keyword filtering at the ETW session
   - router-level filtering for high-volume network events
   - optional network connection aggregation
 - **Hot-path optimizations**:
   - Sigma rules are filtered at load time (`category`/`product`/`service`)
-  - Sigma conditions are transpiled + precompiled at startup
+  - Sigma conditions are transpiled + precompiled at startup and on hot reload
   - process-context enrichment is attached on alerts, not every event
 - **Enrichment**:
   - NT → DOS path normalization
@@ -187,6 +190,10 @@ sigma_rules_path = "rules/sigma"
 yara_enabled = true
 yara_rules_path = "rules/yara"
 
+[reload]
+enabled = true
+debounce_ms = 2000
+
 [allowlist]
 paths = [
   "C:\\Windows\\",
@@ -244,6 +251,7 @@ Environment overrides:
 ```powershell
 set EDR__LOGGING__LEVEL=debug
 set EDR__SCANNER__SIGMA_RULES_PATH=C:\rules\sigma
+set EDR__RELOAD__DEBOUNCE_MS=2000
 set EDR__ALLOWLIST__PATHS=["C:\\Windows\\","C:\\Program Files\\"]
 # optional module-specific override:
 set EDR__SCANNER__YARA_ALLOWLIST_PATHS=["C:\\Windows\\","D:\\Trusted\\"]
@@ -256,6 +264,17 @@ rustinel run --log-level debug
 ```
 
 Note: rule logic evaluation errors are only logged at `warn`, `debug`, or `trace` levels (suppressed at `info`).
+
+### Hot reload
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `enabled` | `true` | Enable local file-based hot reload for Sigma, YARA, and IOC inputs |
+| `debounce_ms` | `2000` | Debounce window for coalescing burst file changes before rebuild/swap |
+
+Notes:
+- Poll cadence is `max(reload.debounce_ms, 2000ms)`.
+- Empty reload results are rejected for safety (previous compiled engines remain active).
 
 ### Active response
 
@@ -290,6 +309,7 @@ More details: `docs/active-response.md`.
 ### Sigma
 
 * Place `.yml` / `.yaml` files under `rules/sigma/`
+* Rules are compiled at startup and hot-reloaded when files change
 * Supported categories include:
   `process_creation`, `network_connection`, `file_event`, `registry_event`,
   `dns_query`, `image_load`, `ps_script`, `wmi_event`, `service_creation`, `task_creation`
@@ -297,7 +317,7 @@ More details: `docs/active-response.md`.
 ### YARA
 
 * Place `.yar` / `.yara` files under `rules/yara/`
-* Rules compile at startup
+* Rules compile at startup and are hot-reloaded when files change
 * Scans trigger on **process creation** (runs in a background worker)
 * Files under allowlisted path prefixes are skipped (`allowlist.paths` by default or `scanner.yara_allowlist_paths` override)
 
@@ -311,6 +331,7 @@ Place indicator files under `rules/ioc/`:
 * `paths_regex.txt` — case-insensitive regexes matched against file paths
 
 Hash checking runs in a dedicated background worker on process creation. Files under allowlisted paths (shared `allowlist.paths` by default, or `ioc.hash_allowlist_paths` override) and files exceeding `max_file_size_mb` are skipped automatically. Domain, IP, and path checks run inline with negligible overhead.
+IOC files are also hot-reloaded when they change.
 
 ---
 

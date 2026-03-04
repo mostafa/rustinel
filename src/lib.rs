@@ -9,6 +9,7 @@ pub mod engine;
 pub mod ioc;
 pub mod models;
 pub mod normalizer;
+pub mod reload;
 pub mod response;
 pub mod scanner;
 pub mod state;

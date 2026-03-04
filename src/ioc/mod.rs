@@ -24,7 +24,7 @@ use tracing::{info, warn};
 const HASH_CACHE_MAX_ENTRIES: usize = 10_000;
 const HASH_CACHE_TTL_SECS: u64 = 6 * 60 * 60;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HashRequirements {
     pub md5: bool,
     pub sha1: bool,
