@@ -21,7 +21,6 @@ NDJSON alerts (non-ECS fields use the `edr.` prefix).
 
 - [Architecture](architecture.md)
 - [Development](development.md)
-- [Enterprise Agent Plan (MVP)](enterprise-agent-plan.md)
 - [Roadmap](roadmap.md)
 
 ## Quick Start (60 seconds)
