@@ -13,7 +13,7 @@ Rustinel is a **high-throughput Windows EDR agent** written in **Rust**. It coll
 
 > ✅ No kernel driver  
 > ✅ User-mode ETW pipeline  
-> ✅ Sigma behavioral detection + YARA scanning + IOCs detection
+> ✅ Sigma behavioral detection, YARA scanning, IOCs detection
 > ✅ Local hot reload for Sigma/YARA/IOC files  
 > ✅ ECS NDJSON alerts + operational logs
 
