@@ -1,28 +1,24 @@
-//! Event normalizer module ("Sysmon-izer")
+//! Shared event normalizer.
 //!
-//! Converts kernel ETW field names to Sigma/Sysmon standard format.
-//! Critical for mapping between kernel events and Sigma rule expectations.
+//! Converts decoded [`SensorEvent`](crate::sensor::SensorEvent) values into the
+//! existing normalized event model while preserving shared enrichment and cache
+//! behavior.
 
-mod field_maps;
-mod mapper;
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::time::SystemTime;
+
+use chrono::{DateTime, SecondsFormat, Utc};
 
 use crate::models::*;
+use crate::sensor::{SensorAction, SensorEvent, SensorPayload};
 use crate::state::{
     AggregationResult, ConnectionAggregator, DnsCache, ProcessCache, Protocol, SidCache,
 };
-#[cfg(windows)]
-use crate::utils::query_process_command_line;
-use crate::utils::{convert_nt_to_dos, parse_metadata};
-use chrono::{DateTime, SecondsFormat, Utc};
-use ferrisetw::parser::Parser;
-use ferrisetw::schema_locator::SchemaLocator;
-use ferrisetw::EventRecord;
-use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Arc;
+use crate::utils::{convert_nt_to_dos, query_process_command_line};
 
-/// Event normalizer that converts ETW events to Sigma-compatible format
+/// Event normalizer that converts shared sensor events to normalized events.
 pub struct Normalizer {
-    schema_locator: SchemaLocator,
     process_cache: Arc<ProcessCache>,
     sid_cache: Arc<SidCache>,
     dns_cache: Arc<DnsCache>,
@@ -31,7 +27,7 @@ pub struct Normalizer {
 }
 
 impl Normalizer {
-    /// Creates a new normalizer instance
+    /// Creates a new normalizer instance.
     pub fn new(
         process_cache: Arc<ProcessCache>,
         sid_cache: Arc<SidCache>,
@@ -40,7 +36,6 @@ impl Normalizer {
         aggregation_enabled: bool,
     ) -> Self {
         Self {
-            schema_locator: SchemaLocator::default(),
             process_cache,
             sid_cache,
             dns_cache,
@@ -49,383 +44,169 @@ impl Normalizer {
         }
     }
 
-    /// Normalize an ETW event to Sigma-compatible format
-    pub fn normalize(
-        &self,
-        record: &EventRecord,
-        category: EventCategory,
-    ) -> Option<NormalizedEvent> {
-        // Get timestamp
-        let timestamp = format_timestamp(record);
-
-        // Create parser for this event
-        let schema = match self.schema_locator.event_schema(record) {
-            Ok(schema) => schema,
-            Err(e) => {
-                // Keep at TRACE to avoid flooding debug logs with high-volume schema misses.
-                tracing::trace!(
-                    "Failed to get schema for event: {:?} (Category: {:?}, ID: {})",
-                    e,
-                    category,
-                    record.event_id()
-                );
-                return None;
-            }
-        };
-
-        let parser = Parser::create(record, &schema);
-
-        // Normalize based on category
-        let fields = match category {
-            EventCategory::Process => self.normalize_process(&parser, record),
-            EventCategory::File => self.normalize_file(&parser, record),
-            EventCategory::Registry => self.normalize_registry(&parser, record),
-            EventCategory::Network => self.normalize_network(&parser, record),
-            EventCategory::Dns => self.normalize_dns(&parser, record),
-            EventCategory::ImageLoad => self.normalize_image_load(&parser, record),
-            EventCategory::Scripting => self.normalize_powershell(&parser, record),
-            EventCategory::Wmi => self.normalize_wmi(&parser, record),
-            EventCategory::Service => self.normalize_service(&parser, record),
-            EventCategory::Task => self.normalize_task(&parser, record),
-        };
-
-        // TRACE only: normalization misses can be frequent on noisy providers.
-        if fields.is_none() && tracing::enabled!(tracing::Level::TRACE) {
-            tracing::trace!(
-                "Failed to normalize event {} (Category: {:?}, OpCode: {})",
-                record.event_id(),
-                category,
-                record.opcode()
-            );
-        }
-
-        let fields = fields?;
-
-        // Map Kernel ETW OpCode/EventID to Sysmon Event ID for Sigma rule compatibility
-        let sysmon_event_id =
-            mapper::map_to_sysmon_id(category, record.opcode(), record.event_id());
+    /// Normalize a shared sensor event to Sigma-compatible format.
+    pub fn normalize(&self, event: &SensorEvent) -> Option<NormalizedEvent> {
+        let fields = match &event.payload {
+            SensorPayload::Process(fields) => self.normalize_process(event, fields.clone()),
+            SensorPayload::Network(fields) => self.normalize_network(event, fields.clone()),
+            SensorPayload::File(fields) => self.normalize_file(event, fields.clone()),
+            SensorPayload::Dns(fields) => self.normalize_dns(event, fields.clone()),
+            SensorPayload::Registry(fields) => self.normalize_registry(event, fields.clone()),
+            SensorPayload::ImageLoad(fields) => self.normalize_image_load(fields.clone()),
+            SensorPayload::Scripting(fields) => self.normalize_powershell(fields.clone()),
+            SensorPayload::Wmi(fields) => self.normalize_wmi(fields.clone()),
+            SensorPayload::Service(fields) => self.normalize_service(event, fields.clone()),
+            SensorPayload::Task(fields) => self.normalize_task(event, fields.clone()),
+        }?;
 
         Some(NormalizedEvent {
-            timestamp,
-            category,
-            event_id: sysmon_event_id,
-            event_id_string: sysmon_event_id.to_string(), // Cache string for zero-copy flatten()
-            opcode: record.opcode(),                      // Keep original OpCode for debugging
+            timestamp: format_timestamp(event.timestamp),
+            platform: event.platform,
+            provider: event.provider.to_string(),
+            category: event.category(),
+            event_id: event.normalization.event_id,
+            event_id_string: event.normalization.event_id.to_string(),
+            opcode: event.normalization.action_code,
             fields,
             process_context: None,
         })
     }
 
-    /// Normalize process creation/access events
-    fn normalize_process(&self, parser: &Parser, record: &EventRecord) -> Option<EventFields> {
-        let mappings = field_maps::process_creation_mappings();
-
-        // Extract CreateTime (critical for compound key)
-        // Try multiple field names as ETW providers may use different names
-        let creation_time_opt = try_get_uint_as_u64(parser, "CreateTime")
-            .or_else(|| try_get_uint_as_u64(parser, "ProcessStartTime"));
-        // Some providers expose a TimeStamp field, but it may be the event timestamp.
-        let creation_time_opt_with_timestamp =
-            creation_time_opt.or_else(|| try_get_uint_as_u64(parser, "TimeStamp"));
-
-        // Extract raw paths from ETW (may be in NT Device format)
-        let raw_image = try_get_string_any(
-            parser,
-            &[
-                mappings.get_etw_field("Image")?,
-                "ImageFileName",
-                "ProcessName",
-            ],
-        );
-        let raw_parent_image = try_get_string_any(
-            parser,
-            &[mappings.get_etw_field("ParentImage")?, "ParentProcessName"],
-        );
-        let raw_current_directory =
-            try_get_string(parser, mappings.get_etw_field("CurrentDirectory")?);
-
-        // Step 1: Normalize paths (NT Device -> DOS)
-        let image = raw_image.map(|p| convert_nt_to_dos(&p));
-        let parent_image = raw_parent_image.map(|p| convert_nt_to_dos(&p));
-        let current_directory = raw_current_directory.map(|p| convert_nt_to_dos(&p));
-
-        // Step 2: Parse PE metadata (only on Process Start for performance)
-        let opcode = record.opcode();
-        let (pe_original_filename, pe_product, pe_description) = if opcode == 1 {
-            if let Some(ref path) = image {
-                if let Some(metadata) = parse_metadata(path) {
-                    (
-                        metadata.original_filename,
-                        metadata.product,
-                        metadata.description,
-                    )
-                } else {
-                    (None, None, None)
-                }
-            } else {
-                (None, None, None)
-            }
-        } else {
-            (None, None, None)
-        };
-
-        let mut fields = ProcessCreationFields {
-            image: image.clone(),
-            original_file_name: pe_original_filename.clone(),
-            product: pe_product.clone(),
-            description: pe_description.clone(),
-            target_image: try_get_string(parser, mappings.get_etw_field("TargetImage")?)
-                .map(|p| convert_nt_to_dos(&p)),
-            command_line: try_get_string(parser, mappings.get_etw_field("CommandLine")?),
-            process_id: try_get_uint(parser, mappings.get_etw_field("ProcessId")?)
-                .or_else(|| try_get_uint_from_payload(record)),
-            parent_process_id: try_get_uint(parser, mappings.get_etw_field("ParentProcessId")?),
-            parent_image: parent_image.clone(),
-            parent_command_line: try_get_string(
-                parser,
-                mappings.get_etw_field("ParentCommandLine")?,
-            ),
-            current_directory,
-            integrity_level: try_get_string(parser, mappings.get_etw_field("IntegrityLevel")?),
-            user: try_get_string(parser, mappings.get_etw_field("User")?),
-            logon_id: try_get_string(parser, mappings.get_etw_field("LogonId")?),
-            logon_guid: try_get_string(parser, mappings.get_etw_field("LogonGuid")?),
-        };
-
+    fn normalize_process(
+        &self,
+        event: &SensorEvent,
+        mut fields: ProcessCreationFields,
+    ) -> Option<EventFields> {
         self.resolve_user_field(&mut fields.user);
 
-        // Best-effort CommandLine enrichment if ETW did not provide it.
-        #[cfg(windows)]
-        if opcode == 1 && fields.command_line.is_none() {
-            let pid = fields
-                .process_id
-                .as_ref()
-                .and_then(|p| p.parse::<u32>().ok())
-                .unwrap_or_else(|| record.process_id());
-            if let Some(cmd) = query_process_command_line(pid) {
-                fields.command_line = Some(cmd);
+        let pid = event_pid(event, fields.process_id.as_deref());
+        if event.action == SensorAction::Start && fields.command_line.is_none() && pid != 0 {
+            if let Some(command_line) = query_process_command_line(pid) {
+                fields.command_line = Some(command_line);
             }
         }
 
-        // Update process cache based on OpCode
-        if opcode == 1 {
-            // Process Start - Enrich with parent metadata and add to cache
-            if let Some(ref img) = fields.image {
-                let creation_time = creation_time_opt_with_timestamp
-                    .unwrap_or_else(|| record.raw_timestamp() as u64); // Fallback to event timestamp
-
-                // FIXED: Use ProcessID from payload (child) instead of header (parent).
-                // The event header process_id() in ProcessStart is the PARENT PID (creator).
-                let pid = fields
-                    .process_id
-                    .as_ref()
-                    .and_then(|p| p.parse::<u32>().ok())
-                    .unwrap_or_else(|| record.process_id());
-
-                // Parse parent PID as u32 for cache lookup
-                let parent_pid_u32 = fields
-                    .parent_process_id
-                    .as_ref()
-                    .and_then(|p| p.parse::<u32>().ok());
-
-                // Enrichment: Look up parent metadata from cache
-                let (parent_image_cached, parent_cmd_cached) = if let Some(ppid) = parent_pid_u32 {
-                    if let Some(parent_meta) = self.process_cache.get_metadata(ppid) {
-                        tracing::trace!(
-                            "Enriched process PID={} with parent metadata from cache (PPID={})",
-                            pid,
-                            ppid
-                        );
-                        (Some(parent_meta.image_name), parent_meta.command_line)
+        match event.action {
+            SensorAction::Start => {
+                if let Some(image) = fields.image.clone() {
+                    let parent_pid = parse_optional_u32(fields.parent_process_id.as_deref());
+                    let (parent_image, parent_command_line) = if let Some(parent_pid) = parent_pid {
+                        if let Some(parent_meta) = self.process_cache.get_metadata(parent_pid) {
+                            (Some(parent_meta.image_name), parent_meta.command_line)
+                        } else {
+                            (None, None)
+                        }
                     } else {
                         (None, None)
+                    };
+
+                    if fields.parent_image.is_none() {
+                        fields.parent_image = parent_image;
                     }
-                } else {
-                    (None, None)
-                };
+                    if fields.parent_command_line.is_none() {
+                        fields.parent_command_line = parent_command_line;
+                    }
 
-                // If ParentImage/ParentCommandLine are missing from ETW, use cached values
-                if fields.parent_image.is_none() {
-                    fields.parent_image = parent_image_cached.clone();
-                }
-                if fields.parent_command_line.is_none() {
-                    fields.parent_command_line = parent_cmd_cached.clone();
-                }
+                    if pid != 0 {
+                        let start_time = event
+                            .process_start_key
+                            .map(|key| key.start_time)
+                            .unwrap_or_else(|| process_cache_time_fallback(event.timestamp));
 
-                // Add to cache with compound key, enriched parent data, and PE metadata
-                self.process_cache.add(
-                    pid,
-                    creation_time,
-                    img.clone(),
-                    fields.command_line.clone(),
-                    fields.user.clone(),
-                    parent_pid_u32,
-                    fields.parent_image.clone(),
-                    fields.parent_command_line.clone(),
-                    pe_original_filename,
-                    pe_product,
-                    pe_description,
-                    fields.current_directory.clone(),
-                    fields.integrity_level.clone(),
-                    fields.logon_id.clone(),
-                    fields.logon_guid.clone(),
-                );
-                tracing::trace!(
-                    "Added process to cache: PID={} CreateTime={} Image={}",
-                    pid,
-                    creation_time,
-                    img
-                );
+                        self.process_cache.add(
+                            pid,
+                            start_time,
+                            image,
+                            fields.command_line.clone(),
+                            fields.user.clone(),
+                            parent_pid,
+                            fields.parent_image.clone(),
+                            fields.parent_command_line.clone(),
+                            fields.original_file_name.clone(),
+                            fields.product.clone(),
+                            fields.description.clone(),
+                            fields.current_directory.clone(),
+                            fields.integrity_level.clone(),
+                            fields.logon_id.clone(),
+                            fields.logon_guid.clone(),
+                        );
+                    }
+                }
             }
-        } else if opcode == 2 {
-            // Process Stop - Remove from cache
-            // FIXED: Use ProcessID from payload to be consistent
-            let pid = fields
-                .process_id
-                .as_ref()
-                .and_then(|p| p.parse::<u32>().ok())
-                .unwrap_or_else(|| record.process_id());
-            let creation_time =
-                creation_time_opt.or_else(|| self.process_cache.get_latest_creation_time(pid));
-            if let Some(creation_time) = creation_time {
-                self.process_cache.remove(pid, creation_time);
-                tracing::trace!(
-                    "Removed process from cache: PID={} CreateTime={}",
-                    pid,
-                    creation_time
-                );
-            } else {
-                tracing::trace!(
-                    "Process stop missing CreateTime; no cache entry found for PID={}",
-                    pid
-                );
+            SensorAction::Stop => {
+                let creation_time =
+                    event
+                        .process_start_key
+                        .map(|key| key.start_time)
+                        .or_else(|| {
+                            if pid == 0 {
+                                None
+                            } else {
+                                self.process_cache.get_latest_creation_time(pid)
+                            }
+                        });
+
+                if let Some(creation_time) = creation_time {
+                    self.process_cache.remove(pid, creation_time);
+                }
+                return None;
             }
-            return None;
+            _ => {}
         }
 
         Some(EventFields::ProcessCreation(fields))
     }
 
-    /// Normalize file events
-    fn normalize_file(&self, parser: &Parser, _record: &EventRecord) -> Option<EventFields> {
-        // Determine which mapping to use based on event ID (if available)
-        // For now, use generic file_event mappings
-        let mappings = field_maps::file_event_mappings();
-        let raw_target_filename = try_get_string(parser, mappings.get_etw_field("TargetFilename")?);
-
-        // Regular file event - normalize target filename path
-        let fields = FileEventFields {
-            target_filename: raw_target_filename.map(|p| convert_nt_to_dos(&p)),
-            process_id: try_get_uint(parser, mappings.get_etw_field("ProcessId")?),
-            image: try_get_string(parser, mappings.get_etw_field("Image")?)
-                .map(|p| convert_nt_to_dos(&p)),
-            creation_utc_time: try_get_string(parser, mappings.get_etw_field("CreationUtcTime")?),
-            previous_creation_utc_time: try_get_string(parser, "PreviousCreationTime"),
-            user: try_get_string(parser, mappings.get_etw_field("User")?),
-        };
-
-        let mut fields = fields;
+    fn normalize_file(
+        &self,
+        event: &SensorEvent,
+        mut fields: FileEventFields,
+    ) -> Option<EventFields> {
         self.resolve_user_field(&mut fields.user);
+
+        let pid = event_pid(event, fields.process_id.as_deref());
+        if pid != 0 {
+            if let Some(image) = self.process_cache.get_image(pid) {
+                fields.image = Some(convert_nt_to_dos(&image));
+            }
+        }
 
         Some(EventFields::FileEvent(fields))
     }
 
-    /// Normalize registry events
-    fn normalize_registry(&self, parser: &Parser, record: &EventRecord) -> Option<EventFields> {
-        let event_mappings = field_maps::registry_event_mappings();
-        let modify_mappings = field_maps::registry_modify_mappings();
-
-        let mut fields = RegistryEventFields {
-            target_object: try_get_string(parser, event_mappings.get_etw_field("TargetObject")?)
-                .or_else(|| try_get_string(parser, modify_mappings.get_etw_field("TargetObject")?)),
-            details: try_get_string(parser, event_mappings.get_etw_field("Details")?)
-                .or_else(|| try_get_string(parser, modify_mappings.get_etw_field("Details")?)),
-            process_id: try_get_uint(parser, event_mappings.get_etw_field("ProcessId")?),
-            image: try_get_string(parser, event_mappings.get_etw_field("Image")?)
-                .map(|p| convert_nt_to_dos(&p)),
-            event_type: try_get_string(parser, "EventType"),
-            user: try_get_string(parser, event_mappings.get_etw_field("User")?),
-            new_name: try_get_string(parser, "NewName"),
-        };
-
+    fn normalize_registry(
+        &self,
+        event: &SensorEvent,
+        mut fields: RegistryEventFields,
+    ) -> Option<EventFields> {
         self.resolve_user_field(&mut fields.user);
 
-        // Enrich with cached process data if image is missing
         if fields.image.is_none() {
-            let pid = record.process_id();
-            if let Some(cached_image) = self.process_cache.get_image(pid) {
-                fields.image = Some(convert_nt_to_dos(&cached_image));
-                tracing::trace!("Enriched registry event with cached image for PID={}", pid);
+            let pid = event_pid(event, fields.process_id.as_deref());
+            if let Some(image) = self.process_cache.get_image(pid) {
+                fields.image = Some(convert_nt_to_dos(&image));
             }
         }
 
         Some(EventFields::RegistryEvent(fields))
     }
 
-    /// Normalize network connection events
-    fn normalize_network(&self, parser: &Parser, record: &EventRecord) -> Option<EventFields> {
-        let mappings = field_maps::network_connection_mappings();
+    fn normalize_network(
+        &self,
+        event: &SensorEvent,
+        mut fields: NetworkConnectionFields,
+    ) -> Option<EventFields> {
+        self.resolve_user_field(&mut fields.user);
 
-        // DEBUG: Try multiple possible field names for network events
-        // Microsoft-Windows-Kernel-Network may use different field names
-        let destination_ip = try_get_ip(parser, "daddr")
-            .or_else(|| try_get_ip(parser, "DestinationAddress"))
-            .or_else(|| try_get_ip(parser, "RemoteAddress"))
-            .or_else(|| try_get_ip(parser, "dstaddr"));
-
-        let source_ip = try_get_ip(parser, "saddr")
-            .or_else(|| try_get_ip(parser, "SourceAddress"))
-            .or_else(|| try_get_ip(parser, "LocalAddress"))
-            .or_else(|| try_get_ip(parser, "srcaddr"));
-
-        // Ports are stored in network byte order (big-endian), need conversion
-        let destination_port = try_get_port(parser, "dport")
-            .or_else(|| try_get_port(parser, "DestinationPort"))
-            .or_else(|| try_get_port(parser, "RemotePort"))
-            .or_else(|| try_get_port(parser, "dstport"));
-
-        let source_port = try_get_port(parser, "sport")
-            .or_else(|| try_get_port(parser, "SourcePort"))
-            .or_else(|| try_get_port(parser, "LocalPort"))
-            .or_else(|| try_get_port(parser, "srcport"));
-
-        tracing::trace!(
-            "Network event (ID={}, OpCode={}): daddr={:?}, saddr={:?}, dport={:?}, sport={:?}",
-            record.event_id(),
-            record.opcode(),
-            destination_ip,
-            source_ip,
-            destination_port,
-            source_port
-        );
-
-        let mut fields = NetworkConnectionFields {
-            destination_ip,
-            source_ip,
-            destination_port,
-            source_port,
-            process_id: try_get_uint(parser, mappings.get_etw_field("ProcessId")?)
-                .or_else(|| Some(record.process_id().to_string())),
-            image: try_get_string(parser, mappings.get_etw_field("Image")?)
-                .map(|p| convert_nt_to_dos(&p)),
-            user: try_get_string(parser, mappings.get_etw_field("User")?),
-            destination_hostname: try_get_string(
-                parser,
-                mappings.get_etw_field("DestinationHostname")?,
-            ),
-        };
-
-        // Enrich with cached process data if image is missing
         if fields.image.is_none() {
-            let pid = record.process_id();
-            if let Some(cached_image) = self.process_cache.get_image(pid) {
-                fields.image = Some(convert_nt_to_dos(&cached_image));
-                tracing::trace!("Enriched network event with cached image for PID={}", pid);
+            let pid = event_pid(event, fields.process_id.as_deref());
+            if let Some(image) = self.process_cache.get_image(pid) {
+                fields.image = Some(convert_nt_to_dos(&image));
             }
         }
 
         if fields.destination_hostname.is_none() {
-            if let Some(ref destination_ip) = fields.destination_ip {
+            if let Some(destination_ip) = fields.destination_ip.as_deref() {
                 if let Ok(ip) = destination_ip.parse::<IpAddr>() {
                     if let Some(hostname) = self.dns_cache.lookup(&ip) {
                         fields.destination_hostname = Some(hostname);
@@ -434,35 +215,27 @@ impl Normalizer {
             }
         }
 
-        // Connection aggregation: suppress repeated connections to same destination
         if self.aggregation_enabled {
-            if let (Some(ref image), Some(ref dest_ip_str), Some(ref dest_port_str)) = (
-                &fields.image,
-                &fields.destination_ip,
-                &fields.destination_port,
+            if let (Some(image), Some(dest_ip), Some(dest_port)) = (
+                fields.image.as_deref(),
+                fields.destination_ip.as_deref(),
+                fields.destination_port.as_deref(),
             ) {
                 if let (Ok(dest_ip), Ok(dest_port)) =
-                    (dest_ip_str.parse::<IpAddr>(), dest_port_str.parse::<u16>())
+                    (dest_ip.parse::<IpAddr>(), dest_port.parse::<u16>())
                 {
-                    let pid = record.process_id();
-                    // Determine protocol from ETW event ID (12=TCP, 14=UDP for Kernel-Network)
-                    let protocol = match record.event_id() {
-                        12 => Protocol::Tcp,
-                        14 => Protocol::Udp,
+                    let protocol = match fields.protocol.as_deref() {
+                        Some("tcp") => Protocol::Tcp,
+                        Some("udp") => Protocol::Udp,
                         _ => Protocol::Unknown,
                     };
+                    let pid = event_pid(event, fields.process_id.as_deref());
 
                     let result = self
                         .connection_aggregator
                         .record(image, dest_ip, dest_port, protocol, pid);
 
                     if result == AggregationResult::Aggregated {
-                        tracing::trace!(
-                            "Suppressed aggregated connection: {} -> {}:{}",
-                            image,
-                            dest_ip,
-                            dest_port
-                        );
                         return None;
                     }
                 }
@@ -472,25 +245,15 @@ impl Normalizer {
         Some(EventFields::NetworkConnection(fields))
     }
 
-    /// Normalize DNS query events
-    fn normalize_dns(&self, parser: &Parser, record: &EventRecord) -> Option<EventFields> {
-        let mappings = field_maps::dns_query_mappings();
-
-        let mut fields = DnsQueryFields {
-            query_name: try_get_string(parser, mappings.get_etw_field("QueryName")?),
-            query_results: try_get_string(parser, mappings.get_etw_field("QueryResults")?),
-            query_status: try_get_uint(parser, mappings.get_etw_field("QueryStatus")?),
-            process_id: try_get_uint(parser, mappings.get_etw_field("ProcessId")?),
-            image: try_get_string(parser, mappings.get_etw_field("Image")?)
-                .map(|p| convert_nt_to_dos(&p)),
-        };
-
-        // Enrich with cached process data if image is missing
+    fn normalize_dns(
+        &self,
+        event: &SensorEvent,
+        mut fields: DnsQueryFields,
+    ) -> Option<EventFields> {
         if fields.image.is_none() {
-            let pid = record.process_id();
-            if let Some(cached_image) = self.process_cache.get_image(pid) {
-                fields.image = Some(convert_nt_to_dos(&cached_image));
-                tracing::trace!("Enriched DNS event with cached image for PID={}", pid);
+            let pid = event_pid(event, fields.process_id.as_deref());
+            if let Some(image) = self.process_cache.get_image(pid) {
+                fields.image = Some(convert_nt_to_dos(&image));
             }
         }
 
@@ -498,146 +261,57 @@ impl Normalizer {
             fields.query_name.as_deref(),
             fields.query_results.as_deref(),
         ) {
-            let hostname = query_name.to_string();
             for ip in extract_ips_from_query_results(query_results) {
-                self.dns_cache.update(ip, hostname.clone());
+                self.dns_cache.update(ip, query_name.to_string());
             }
         }
 
         Some(EventFields::DnsQuery(fields))
     }
 
-    /// Normalize image load events
-    fn normalize_image_load(&self, parser: &Parser, _record: &EventRecord) -> Option<EventFields> {
-        let mappings = field_maps::image_load_mappings();
-
-        // Extract and normalize paths
-        let raw_image_loaded = try_get_string(parser, mappings.get_etw_field("ImageLoaded")?);
-        let image_loaded = raw_image_loaded.map(|p| convert_nt_to_dos(&p));
-
-        // Parse PE metadata from the loaded image
-        let (pe_original_filename, pe_product, pe_description) =
-            if let Some(ref path) = image_loaded {
-                if let Some(metadata) = parse_metadata(path) {
-                    (
-                        metadata.original_filename,
-                        metadata.product,
-                        metadata.description,
-                    )
-                } else {
-                    (None, None, None)
-                }
-            } else {
-                (None, None, None)
-            };
-
-        let fields = ImageLoadFields {
-            image_loaded,
-            process_id: try_get_uint(parser, mappings.get_etw_field("ProcessId")?),
-            image: try_get_string(parser, mappings.get_etw_field("Image")?)
-                .map(|p| convert_nt_to_dos(&p)),
-            original_file_name: pe_original_filename,
-            product: pe_product,
-            description: pe_description,
-            signed: try_get_string(parser, mappings.get_etw_field("Signed")?),
-            signature: try_get_string(parser, mappings.get_etw_field("Signature")?),
-            user: try_get_string(parser, mappings.get_etw_field("User")?),
-        };
-
+    fn normalize_image_load(&self, mut fields: ImageLoadFields) -> Option<EventFields> {
+        self.resolve_user_field(&mut fields.user);
         Some(EventFields::ImageLoad(fields))
     }
 
-    /// Normalize PowerShell script events
-    fn normalize_powershell(&self, parser: &Parser, _record: &EventRecord) -> Option<EventFields> {
-        let mappings = field_maps::powershell_script_mappings();
-
-        let fields = PowerShellScriptFields {
-            script_block_text: try_get_string(parser, mappings.get_etw_field("ScriptBlockText")?),
-            script_block_id: try_get_string(parser, mappings.get_etw_field("ScriptBlockId")?),
-            path: try_get_string(parser, mappings.get_etw_field("Path")?)
-                .map(|p| convert_nt_to_dos(&p)),
-            process_id: try_get_uint(parser, mappings.get_etw_field("ProcessId")?),
-            image: try_get_string(parser, mappings.get_etw_field("Image")?)
-                .map(|p| convert_nt_to_dos(&p)),
-            user: try_get_string(parser, mappings.get_etw_field("User")?),
-        };
-
+    fn normalize_powershell(&self, mut fields: PowerShellScriptFields) -> Option<EventFields> {
+        self.resolve_user_field(&mut fields.user);
         Some(EventFields::PowerShellScript(fields))
     }
 
-    /// Normalize WMI events
-    fn normalize_wmi(&self, parser: &Parser, _record: &EventRecord) -> Option<EventFields> {
-        let mappings = field_maps::wmi_event_mappings();
-
-        let fields = WmiEventFields {
-            operation: try_get_string(parser, mappings.get_etw_field("Operation")?),
-            user: try_get_string(parser, mappings.get_etw_field("User")?),
-            query: try_get_string(parser, mappings.get_etw_field("Query")?),
-            process_id: try_get_uint(parser, mappings.get_etw_field("ProcessId")?),
-            image: try_get_string(parser, mappings.get_etw_field("Image")?)
-                .map(|p| convert_nt_to_dos(&p)),
-            event_namespace: try_get_string(parser, mappings.get_etw_field("EventNamespace")?),
-            event_type: try_get_string(parser, mappings.get_etw_field("EventType")?),
-            destination_hostname: try_get_string(
-                parser,
-                mappings.get_etw_field("DestinationHostname")?,
-            ),
-        };
-
+    fn normalize_wmi(&self, mut fields: WmiEventFields) -> Option<EventFields> {
+        self.resolve_user_field(&mut fields.user);
         Some(EventFields::WmiEvent(fields))
     }
 
-    /// Normalize service creation events
-    /// Windows Event ID 7045 from Service Control Manager
-    fn normalize_service(&self, parser: &Parser, record: &EventRecord) -> Option<EventFields> {
-        let mappings = field_maps::service_creation_mappings();
+    fn normalize_service(
+        &self,
+        event: &SensorEvent,
+        mut fields: ServiceCreationFields,
+    ) -> Option<EventFields> {
+        self.resolve_user_field(&mut fields.user);
 
-        let mut fields = ServiceCreationFields {
-            service_name: try_get_string(parser, mappings.get_etw_field("ServiceName")?),
-            service_file_name: try_get_string(parser, mappings.get_etw_field("ServiceFileName")?)
-                .map(|p| convert_nt_to_dos(&p)),
-            service_type: try_get_uint(parser, mappings.get_etw_field("ServiceType")?),
-            start_type: try_get_uint(parser, mappings.get_etw_field("StartType")?),
-            account_name: try_get_string(parser, mappings.get_etw_field("AccountName")?),
-            user: try_get_string(parser, mappings.get_etw_field("User")?),
-            process_id: try_get_uint(parser, mappings.get_etw_field("ProcessId")?),
-            image: try_get_string(parser, mappings.get_etw_field("Image")?)
-                .map(|p| convert_nt_to_dos(&p)),
-        };
-
-        // Enrich with cached process data if image is missing
         if fields.image.is_none() {
-            let pid = record.process_id();
-            if let Some(cached_image) = self.process_cache.get_image(pid) {
-                fields.image = Some(convert_nt_to_dos(&cached_image));
-                tracing::trace!("Enriched service event with cached image for PID={}", pid);
+            let pid = event_pid(event, fields.process_id.as_deref());
+            if let Some(image) = self.process_cache.get_image(pid) {
+                fields.image = Some(convert_nt_to_dos(&image));
             }
         }
 
         Some(EventFields::ServiceCreation(fields))
     }
 
-    /// Normalize task scheduler events
-    /// Windows Event ID 106 from Task Scheduler
-    fn normalize_task(&self, parser: &Parser, record: &EventRecord) -> Option<EventFields> {
-        let mappings = field_maps::task_creation_mappings();
+    fn normalize_task(
+        &self,
+        event: &SensorEvent,
+        mut fields: TaskCreationFields,
+    ) -> Option<EventFields> {
+        self.resolve_user_field(&mut fields.user);
 
-        let mut fields = TaskCreationFields {
-            task_name: try_get_string(parser, mappings.get_etw_field("TaskName")?),
-            task_content: try_get_string(parser, mappings.get_etw_field("TaskContent")?),
-            user_name: try_get_string(parser, mappings.get_etw_field("UserName")?),
-            user: try_get_string(parser, mappings.get_etw_field("User")?),
-            process_id: try_get_uint(parser, mappings.get_etw_field("ProcessId")?),
-            image: try_get_string(parser, mappings.get_etw_field("Image")?)
-                .map(|p| convert_nt_to_dos(&p)),
-        };
-
-        // Enrich with cached process data if image is missing
         if fields.image.is_none() {
-            let pid = record.process_id();
-            if let Some(cached_image) = self.process_cache.get_image(pid) {
-                fields.image = Some(convert_nt_to_dos(&cached_image));
-                tracing::trace!("Enriched task event with cached image for PID={}", pid);
+            let pid = event_pid(event, fields.process_id.as_deref());
+            if let Some(image) = self.process_cache.get_image(pid) {
+                fields.image = Some(convert_nt_to_dos(&image));
             }
         }
 
@@ -656,8 +330,6 @@ impl Normalizer {
     }
 
     /// Build and attach process context lazily for alert enrichment.
-    /// This is intentionally done outside hot-path normalization to avoid
-    /// cloning process metadata for non-alert events.
     pub fn enrich_process_context(&self, event: &mut NormalizedEvent, fallback_pid: u32) {
         if event.process_context.is_some() {
             return;
@@ -717,132 +389,28 @@ impl Normalizer {
     }
 }
 
-// ============================================================================
-// ETW Property Extraction Utilities
-// ============================================================================
-
-/// Format event timestamp to ISO 8601 string
-fn format_timestamp(record: &EventRecord) -> String {
-    let timestamp = record.raw_timestamp();
-    // Convert Windows FILETIME to Unix timestamp
-    // FILETIME is 100-nanosecond intervals since 1601-01-01
-    let unix_epoch_delta = 116444736000000000i64; // 100-ns intervals between 1601 and 1970
-    let unix_100ns = if timestamp >= unix_epoch_delta {
-        timestamp - unix_epoch_delta
-    } else {
-        0
-    };
-    let secs = unix_100ns / 10_000_000;
-    let nanos = ((unix_100ns % 10_000_000) * 100) as u32;
-
-    DateTime::<Utc>::from_timestamp(secs, nanos)
-        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap())
-        .to_rfc3339_opts(SecondsFormat::Secs, true)
+fn event_pid(event: &SensorEvent, explicit_pid: Option<&str>) -> u32 {
+    explicit_pid
+        .and_then(|value| value.parse::<u32>().ok())
+        .or(event.pid)
+        .unwrap_or(0)
 }
 
-/// Try to extract a string property from the event
-fn try_get_string(parser: &Parser, property_name: &str) -> Option<String> {
-    match parser.try_parse::<String>(property_name) {
-        Ok(value) => {
-            // Handle null-terminated strings from kernel
-            let trimmed = value.trim_end_matches('\0').to_string();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed)
-            }
-        }
-        Err(_) => None,
-    }
+fn parse_optional_u32(value: Option<&str>) -> Option<u32> {
+    value.and_then(|value| value.parse::<u32>().ok())
 }
 
-/// Try multiple string properties and return the first non-empty value
-fn try_get_string_any(parser: &Parser, property_names: &[&str]) -> Option<String> {
-    for name in property_names {
-        if let Some(value) = try_get_string(parser, name) {
-            return Some(value);
-        }
-    }
-    None
+fn format_timestamp(timestamp: SystemTime) -> String {
+    DateTime::<Utc>::from(timestamp).to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-/// Try to extract a uint property from the event and convert to string
-fn try_get_uint(parser: &Parser, property_name: &str) -> Option<String> {
-    // Try different uint sizes
-    if let Ok(value) = parser.try_parse::<u32>(property_name) {
-        return Some(value.to_string());
-    }
-    if let Ok(value) = parser.try_parse::<u64>(property_name) {
-        return Some(value.to_string());
-    }
-    if let Ok(value) = parser.try_parse::<u16>(property_name) {
-        return Some(value.to_string());
-    }
-    if let Ok(value) = parser.try_parse::<u8>(property_name) {
-        return Some(value.to_string());
-    }
-    None
+fn process_cache_time_fallback(timestamp: SystemTime) -> u64 {
+    timestamp
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
-/// Try to extract a network port (handles big-endian to host byte order conversion)
-/// Network ports in ETW are stored in network byte order (big-endian)
-fn try_get_port(parser: &Parser, property_name: &str) -> Option<String> {
-    // Try u16 first (most common for ports)
-    if let Ok(value) = parser.try_parse::<u16>(property_name) {
-        // Convert from network byte order (big-endian) to host byte order
-        let port = u16::from_be(value);
-        return Some(port.to_string());
-    }
-    // Try u32 in case it's stored as larger type
-    if let Ok(value) = parser.try_parse::<u32>(property_name) {
-        // Take lower 16 bits and swap
-        let port = u16::from_be(value as u16);
-        return Some(port.to_string());
-    }
-    None
-}
-
-/// Try to extract a uint property from the event as u64 (for timestamps)
-fn try_get_uint_as_u64(parser: &Parser, property_name: &str) -> Option<u64> {
-    // Try u64 first (most common for FILETIME)
-    if let Ok(value) = parser.try_parse::<u64>(property_name) {
-        return Some(value);
-    }
-    // Try i64 (signed variant)
-    if let Ok(value) = parser.try_parse::<i64>(property_name) {
-        return Some(value as u64);
-    }
-    // Try u32 and extend
-    if let Ok(value) = parser.try_parse::<u32>(property_name) {
-        return Some(value as u64);
-    }
-    None
-}
-
-/// Try to extract ProcessID from event payload (fallback)
-fn try_get_uint_from_payload(record: &EventRecord) -> Option<String> {
-    // Fallback: try to get ProcessID directly from event header
-    Some(record.process_id().to_string())
-}
-
-/// Try to extract an IP address (handles both IPv4 and IPv6)
-fn try_get_ip(parser: &Parser, property_name: &str) -> Option<String> {
-    // Try using ferrisetw's IpAddr support
-    if let Ok(ip) = parser.try_parse::<IpAddr>(property_name) {
-        return Some(ip.to_string());
-    }
-
-    // Try as u32 (IPv4 as integer)
-    if let Ok(addr) = parser.try_parse::<u32>(property_name) {
-        let ipv4 = Ipv4Addr::from(addr.to_be_bytes());
-        return Some(ipv4.to_string());
-    }
-
-    // Try as string (already formatted)
-    try_get_string(parser, property_name)
-}
-
-/// Extract IPs from DNS query results (supports IPv4 and IPv6)
 fn extract_ips_from_query_results(value: &str) -> Vec<IpAddr> {
     let mut ips = Vec::new();
     let mut token = String::new();
@@ -869,36 +437,481 @@ fn extract_ips_from_query_results(value: &str) -> Vec<IpAddr> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, SystemTime};
+
     use super::*;
+    use crate::sensor::{Platform, ProcessStartKey, SensorNormalization};
+
+    fn build_normalizer(aggregation_enabled: bool) -> Normalizer {
+        Normalizer::new(
+            Arc::new(ProcessCache::new()),
+            Arc::new(SidCache::new()),
+            Arc::new(DnsCache::new()),
+            Arc::new(ConnectionAggregator::new()),
+            aggregation_enabled,
+        )
+    }
+
+    fn process_start_event(platform: Platform, provider: &'static str, pid: u32) -> SensorEvent {
+        SensorEvent {
+            platform,
+            provider,
+            action: SensorAction::Start,
+            normalization: SensorNormalization {
+                event_id: 1,
+                action_code: 1,
+            },
+            pid: Some(pid),
+            timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+            process_start_key: Some(ProcessStartKey {
+                pid,
+                start_time: 123_456,
+            }),
+            payload: SensorPayload::Process(ProcessCreationFields {
+                image: Some("/usr/bin/curl".to_string()),
+                original_file_name: None,
+                product: None,
+                description: None,
+                target_image: None,
+                command_line: Some("/usr/bin/curl https://example.test".to_string()),
+                process_id: Some(pid.to_string()),
+                parent_process_id: Some("7".to_string()),
+                parent_image: None,
+                parent_command_line: None,
+                current_directory: Some("/tmp".to_string()),
+                integrity_level: None,
+                user: Some("alice".to_string()),
+                logon_id: None,
+                logon_guid: None,
+            }),
+        }
+    }
+
+    fn process_stop_event(
+        platform: Platform,
+        provider: &'static str,
+        pid: u32,
+        with_start_key: bool,
+    ) -> SensorEvent {
+        SensorEvent {
+            platform,
+            provider,
+            action: SensorAction::Stop,
+            normalization: SensorNormalization {
+                event_id: 5,
+                action_code: 2,
+            },
+            pid: Some(pid),
+            timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(20),
+            process_start_key: with_start_key.then_some(ProcessStartKey {
+                pid,
+                start_time: 123_456,
+            }),
+            payload: SensorPayload::Process(ProcessCreationFields {
+                image: None,
+                original_file_name: None,
+                product: None,
+                description: None,
+                target_image: None,
+                command_line: None,
+                process_id: Some(pid.to_string()),
+                parent_process_id: None,
+                parent_image: None,
+                parent_command_line: None,
+                current_directory: None,
+                integrity_level: None,
+                user: Some("alice".to_string()),
+                logon_id: None,
+                logon_guid: None,
+            }),
+        }
+    }
+
+    fn network_event(platform: Platform, provider: &'static str, pid: u32) -> SensorEvent {
+        SensorEvent {
+            platform,
+            provider,
+            action: SensorAction::Connect,
+            normalization: SensorNormalization {
+                event_id: 3,
+                action_code: 12,
+            },
+            pid: Some(pid),
+            timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(30),
+            process_start_key: None,
+            payload: SensorPayload::Network(NetworkConnectionFields {
+                destination_ip: Some("198.51.100.10".to_string()),
+                source_ip: Some("10.0.0.5".to_string()),
+                destination_port: Some("443".to_string()),
+                source_port: Some("51324".to_string()),
+                process_id: Some(pid.to_string()),
+                image: None,
+                user: Some("alice".to_string()),
+                destination_hostname: None,
+                protocol: None,
+            }),
+        }
+    }
+
+    fn file_event(platform: Platform, provider: &'static str, pid: u32) -> SensorEvent {
+        SensorEvent {
+            platform,
+            provider,
+            action: SensorAction::Create,
+            normalization: SensorNormalization {
+                event_id: 11,
+                action_code: 64,
+            },
+            pid: Some(pid),
+            timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(40),
+            process_start_key: None,
+            payload: SensorPayload::File(FileEventFields {
+                source_filename: None,
+                target_filename: Some("/tmp/sample.txt".to_string()),
+                process_id: Some(pid.to_string()),
+                image: None,
+                creation_utc_time: None,
+                previous_creation_utc_time: None,
+                user: Some("alice".to_string()),
+            }),
+        }
+    }
+
+    fn assert_shared_fields_equal(left: &NormalizedEvent, right: &NormalizedEvent, keys: &[&str]) {
+        assert_eq!(left.category, right.category);
+        for key in keys {
+            assert_eq!(
+                left.get_field(key),
+                right.get_field(key),
+                "normalized field mismatch for key {key}",
+            );
+        }
+    }
 
     #[test]
     fn test_normalizer_creation() {
-        use crate::state::ConnectionAggregator;
-        let process_cache = Arc::new(ProcessCache::new());
-        let sid_cache = Arc::new(SidCache::new());
-        let dns_cache = Arc::new(DnsCache::new());
-        let connection_aggregator = Arc::new(ConnectionAggregator::new());
-        let _normalizer = Normalizer::new(
-            process_cache,
-            sid_cache,
-            dns_cache,
-            connection_aggregator,
-            true,
+        let _normalizer = build_normalizer(true);
+    }
+
+    #[test]
+    fn process_stop_events_only_maintain_cache() {
+        let normalizer = build_normalizer(true);
+
+        normalizer.process_cache.add(
+            42,
+            99,
+            "C:\\test.exe".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let event = SensorEvent {
+            platform: Platform::Windows,
+            provider: "etw",
+            action: SensorAction::Stop,
+            normalization: SensorNormalization {
+                event_id: 5,
+                action_code: 2,
+            },
+            pid: Some(42),
+            timestamp: SystemTime::UNIX_EPOCH,
+            process_start_key: Some(ProcessStartKey {
+                pid: 42,
+                start_time: 99,
+            }),
+            payload: SensorPayload::Process(ProcessCreationFields {
+                image: None,
+                original_file_name: None,
+                product: None,
+                description: None,
+                target_image: None,
+                command_line: None,
+                process_id: Some("42".to_string()),
+                parent_process_id: None,
+                parent_image: None,
+                parent_command_line: None,
+                current_directory: None,
+                integrity_level: None,
+                user: None,
+                logon_id: None,
+                logon_guid: None,
+            }),
+        };
+
+        assert!(normalizer.normalize(&event).is_none());
+        assert_eq!(normalizer.process_cache.get_latest_creation_time(42), None);
+    }
+
+    #[test]
+    fn linux_process_stop_without_process_start_key_uses_pid_fallback() {
+        let normalizer = build_normalizer(false);
+
+        let start = process_start_event(Platform::Linux, "ebpf", 42);
+        let stop = process_stop_event(Platform::Linux, "ebpf", 42, false);
+
+        let start_normalized = normalizer
+            .normalize(&start)
+            .expect("linux process start should normalize");
+        assert_eq!(start_normalized.get_field("Image"), Some("/usr/bin/curl"));
+
+        assert!(normalizer.normalize(&stop).is_none());
+        assert_eq!(normalizer.process_cache.get_latest_creation_time(42), None);
+    }
+
+    #[test]
+    fn network_aggregation_suppresses_repeated_connections() {
+        let normalizer = build_normalizer(true);
+        normalizer.process_cache.add(
+            7,
+            1,
+            "C:\\curl.exe".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let build_event = || SensorEvent {
+            platform: Platform::Windows,
+            provider: "etw",
+            action: SensorAction::Connect,
+            normalization: SensorNormalization {
+                event_id: 3,
+                action_code: 12,
+            },
+            pid: Some(7),
+            timestamp: SystemTime::UNIX_EPOCH,
+            process_start_key: None,
+            payload: SensorPayload::Network(NetworkConnectionFields {
+                destination_ip: Some("198.51.100.10".to_string()),
+                source_ip: Some("10.0.0.5".to_string()),
+                destination_port: Some("443".to_string()),
+                source_port: Some("51324".to_string()),
+                process_id: Some("7".to_string()),
+                image: Some("C:\\curl.exe".to_string()),
+                user: None,
+                destination_hostname: None,
+                protocol: Some("tcp".to_string()),
+            }),
+        };
+
+        assert!(normalizer.normalize(&build_event()).is_some());
+        assert!(normalizer.normalize(&build_event()).is_none());
+    }
+
+    #[test]
+    fn normalizer_preserves_sensor_supplied_compat_metadata() {
+        let normalizer = build_normalizer(false);
+        let event = SensorEvent {
+            platform: Platform::Linux,
+            provider: "ebpf",
+            action: SensorAction::Create,
+            normalization: SensorNormalization {
+                event_id: 11,
+                action_code: 64,
+            },
+            pid: Some(9),
+            timestamp: SystemTime::UNIX_EPOCH,
+            process_start_key: None,
+            payload: SensorPayload::File(FileEventFields {
+                source_filename: None,
+                target_filename: Some("/tmp/test".to_string()),
+                process_id: Some("9".to_string()),
+                image: Some("/usr/bin/touch".to_string()),
+                creation_utc_time: None,
+                previous_creation_utc_time: None,
+                user: None,
+            }),
+        };
+
+        let normalized = normalizer
+            .normalize(&event)
+            .expect("file event should normalize");
+        assert_eq!(normalized.event_id, 11);
+        assert_eq!(normalized.event_id_string, "11");
+        assert_eq!(normalized.opcode, 64);
+    }
+
+    #[test]
+    fn file_events_backfill_full_process_image_from_cache() {
+        let normalizer = build_normalizer(false);
+        normalizer.process_cache.add(
+            9,
+            1,
+            "/usr/bin/touch".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let event = SensorEvent {
+            platform: Platform::Linux,
+            provider: "ebpf",
+            action: SensorAction::Create,
+            normalization: SensorNormalization {
+                event_id: 11,
+                action_code: 64,
+            },
+            pid: Some(9),
+            timestamp: SystemTime::UNIX_EPOCH,
+            process_start_key: None,
+            payload: SensorPayload::File(FileEventFields {
+                source_filename: None,
+                target_filename: Some("/tmp/test".to_string()),
+                process_id: Some("9".to_string()),
+                image: Some("touch".to_string()),
+                creation_utc_time: None,
+                previous_creation_utc_time: None,
+                user: None,
+            }),
+        };
+
+        let normalized = normalizer
+            .normalize(&event)
+            .expect("file event should normalize");
+
+        match normalized.fields {
+            EventFields::FileEvent(fields) => {
+                assert_eq!(fields.image.as_deref(), Some("/usr/bin/touch"));
+            }
+            other => panic!("unexpected fields: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn linux_process_start_primes_cache_for_follow_on_network_enrichment() {
+        let normalizer = build_normalizer(false);
+
+        let start = process_start_event(Platform::Linux, "ebpf", 4242);
+        let network = network_event(Platform::Linux, "ebpf", 4242);
+
+        normalizer
+            .normalize(&start)
+            .expect("linux process start should normalize");
+
+        let normalized = normalizer
+            .normalize(&network)
+            .expect("linux network event should normalize");
+
+        match normalized.fields {
+            EventFields::NetworkConnection(fields) => {
+                assert_eq!(fields.image.as_deref(), Some("/usr/bin/curl"));
+                assert_eq!(fields.process_id.as_deref(), Some("4242"));
+                assert_eq!(fields.destination_ip.as_deref(), Some("198.51.100.10"));
+            }
+            other => panic!("unexpected fields: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn equivalent_windows_and_linux_process_events_normalize_same_shared_fields() {
+        let windows = build_normalizer(false)
+            .normalize(&process_start_event(Platform::Windows, "etw", 9001))
+            .expect("windows process start should normalize");
+        let linux = build_normalizer(false)
+            .normalize(&process_start_event(Platform::Linux, "ebpf", 9001))
+            .expect("linux process start should normalize");
+
+        assert_shared_fields_equal(
+            &windows,
+            &linux,
+            &[
+                "Image",
+                "CommandLine",
+                "ProcessId",
+                "ParentProcessId",
+                "CurrentDirectory",
+                "User",
+            ],
         );
     }
 
     #[test]
-    fn test_timestamp_formatting() {
-        // Test with a known FILETIME value
-        // This is a placeholder - actual testing would need a real EventRecord
-        // In practice, you'd mock or create test events
+    fn equivalent_windows_and_linux_network_events_normalize_same_shared_fields() {
+        let windows_normalizer = build_normalizer(false);
+        let linux_normalizer = build_normalizer(false);
+
+        windows_normalizer
+            .normalize(&process_start_event(Platform::Windows, "etw", 9002))
+            .expect("windows process start should normalize");
+        linux_normalizer
+            .normalize(&process_start_event(Platform::Linux, "ebpf", 9002))
+            .expect("linux process start should normalize");
+
+        let windows = windows_normalizer
+            .normalize(&network_event(Platform::Windows, "etw", 9002))
+            .expect("windows network event should normalize");
+        let linux = linux_normalizer
+            .normalize(&network_event(Platform::Linux, "ebpf", 9002))
+            .expect("linux network event should normalize");
+
+        assert_shared_fields_equal(
+            &windows,
+            &linux,
+            &[
+                "DestinationIp",
+                "SourceIp",
+                "DestinationPort",
+                "SourcePort",
+                "ProcessId",
+                "Image",
+                "User",
+                "DestinationHostname",
+                "Protocol",
+            ],
+        );
     }
 
     #[test]
-    fn test_string_null_termination() {
-        // Test that null-terminated strings are properly handled
-        let test_str = "test\0\0\0";
-        let trimmed = test_str.trim_end_matches('\0');
-        assert_eq!(trimmed, "test");
+    fn equivalent_windows_and_linux_file_events_normalize_same_shared_fields() {
+        let windows_normalizer = build_normalizer(false);
+        let linux_normalizer = build_normalizer(false);
+
+        windows_normalizer
+            .normalize(&process_start_event(Platform::Windows, "etw", 9003))
+            .expect("windows process start should normalize");
+        linux_normalizer
+            .normalize(&process_start_event(Platform::Linux, "ebpf", 9003))
+            .expect("linux process start should normalize");
+
+        let windows = windows_normalizer
+            .normalize(&file_event(Platform::Windows, "etw", 9003))
+            .expect("windows file event should normalize");
+        let linux = linux_normalizer
+            .normalize(&file_event(Platform::Linux, "ebpf", 9003))
+            .expect("linux file event should normalize");
+
+        assert_shared_fields_equal(
+            &windows,
+            &linux,
+            &["TargetFilename", "ProcessId", "Image", "User"],
+        );
     }
 }

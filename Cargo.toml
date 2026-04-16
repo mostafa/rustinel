@@ -1,17 +1,19 @@
 [package]
 name = "rustinel"
-version = "0.3.0"
+version = "1.0.0"
 edition = "2021"
 authors = []
-description = "High-performance, memory-safe Windows endpoint detection agent with ETW-based telemetry and Sigma rule engine"
+description = "Open-source EDR for Windows (ETW) and Linux (eBPF) with Sigma, YARA, and IOC detection"
 license = "Apache-2.0"
 rust-version = "1.92"
 default-run = "rustinel"
 
-[dependencies]
-# ETW provider
-ferrisetw = "1.2"
+[workspace]
+members = ["."]
+default-members = ["."]
+resolver = "2"
 
+[dependencies]
 # Sigma detection engine
 # Using regex for pattern matching in Sigma rules
 regex = "1.10"
@@ -29,10 +31,10 @@ sha1 = "0.10"
 sha2 = "0.10"
 
 # Yara scanning
-yara-x = "1.10"
+yara-x = "1.15"
 
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "net"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -52,12 +54,17 @@ arc-swap = "1.7"
 # Configuration
 config = "0.15.19"
 
-# PE parsing and memory-mapped I/O
-pelite = "0.10"
-memmap2 = "0.9"
+# Linux-specific
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { version = "0.13", default-features = false }
+libc = "0.2"
 
 # Windows-specific
 [target.'cfg(windows)'.dependencies]
+# PE parsing and memory-mapped I/O (Windows-only; PE metadata is not used on Linux)
+pelite = "0.10"
+memmap2 = "0.9"
+ferrisetw = "1.2"
 windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Diagnostics_Etw", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_ProcessStatus", "Win32_Storage_FileSystem"] }
 windows-service = "0.8.0"
 

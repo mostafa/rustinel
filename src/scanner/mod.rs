@@ -3,8 +3,6 @@
 //! Handles compiling rules, listening for process events, and scanning files.
 
 use anyhow::{Context, Result};
-use ferrisetw::parser::Parser;
-use ferrisetw::EventRecord;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -14,22 +12,47 @@ use tokio::sync::mpsc::Sender;
 use tracing::{debug, info, warn};
 use yara_x::{Compiler, Rules, Scanner as XScanner};
 
-use crate::collector::EventHandler;
-use crate::models::{EventCategory, MatchDebugLevel, YaraRuleMatch, YaraStringMatch};
+use crate::models::{MatchDebugLevel, YaraRuleMatch, YaraStringMatch};
+use crate::sensor::{SensorAction, SensorEvent, SensorEventHandler, SensorPayload};
 
+/// Strip NT namespace prefix and convert to a path the YARA scanner can open.
+/// On Windows raw ETW paths may arrive as `\??\C:\Windows\...`.
+/// On Linux eBPF paths are already native (`/usr/bin/bash`) — return as-is.
+#[cfg(windows)]
 fn normalize_yara_path(nt_path: &str) -> String {
     let cleaned = nt_path.strip_prefix("\\??\\").unwrap_or(nt_path);
     crate::utils::convert_nt_to_dos(cleaned)
 }
+
+#[cfg(not(windows))]
+fn normalize_yara_path(path: &str) -> String {
+    path.to_string()
+}
+
+/// Normalize a path for allowlist prefix matching.
+/// Windows: backslash separator, lowercase (case-insensitive FS).
+/// Linux:   forward slash separator, case preserved (case-sensitive FS).
+fn normalize_path_for_allowlist(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        path.trim().replace('/', "\\").to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        path.trim().to_string()
+    }
+}
+
+const PATH_SEPARATOR: char = if cfg!(windows) { '\\' } else { '/' };
 
 pub fn normalize_allowlist_paths(values: &[String]) -> Vec<String> {
     values
         .iter()
         .filter(|v| !v.trim().is_empty())
         .map(|value| {
-            let mut normalized = value.trim().replace('/', "\\").to_ascii_lowercase();
-            if !normalized.ends_with('\\') {
-                normalized.push('\\');
+            let mut normalized = normalize_path_for_allowlist(value);
+            if !normalized.ends_with(PATH_SEPARATOR) {
+                normalized.push(PATH_SEPARATOR);
             }
             normalized
         })
@@ -41,10 +64,10 @@ pub fn is_path_allowlisted(path: &str, allowlist_paths: &[String]) -> bool {
         return false;
     }
 
-    let normalized = path.trim().replace('/', "\\").to_ascii_lowercase();
+    let normalized = normalize_path_for_allowlist(path);
     allowlist_paths
         .iter()
-        .any(|prefix| normalized.starts_with(prefix))
+        .any(|prefix| normalized.starts_with(prefix.as_str()))
 }
 
 const MAX_YARA_STRINGS_PER_RULE: usize = 8;
@@ -148,7 +171,7 @@ fn yara_file_identity(path: &str) -> Option<YaraFileIdentity> {
         .unwrap_or(0);
 
     Some(YaraFileIdentity {
-        path: path.replace('/', "\\").to_ascii_lowercase(),
+        path: normalize_path_for_allowlist(path),
         size,
         mtime_nanos,
     })
@@ -246,6 +269,8 @@ impl Scanner {
         path: &str,
         match_debug: MatchDebugLevel,
     ) -> Result<Vec<YaraRuleMatch>> {
+        let path = normalize_yara_path(path);
+        let path = path.as_str();
         let identity = yara_file_identity(path);
         if let Some(identity) = identity.as_ref() {
             if let Ok(mut cache) = self.cache.lock() {
@@ -346,109 +371,62 @@ impl Scanner {
     }
 }
 
-/// ETW Handler that sends file paths to the background worker
+/// Sensor-event handler that sends file paths to the background worker.
 pub struct YaraEventHandler {
     pub tx: Sender<(String, u32)>, // Sends (FilePath, PID)
     pub allowlist_paths: Vec<String>,
 }
 
-fn extract_process_id(parser: &Parser, record: &EventRecord) -> u32 {
-    // Kernel-Process ProcessStart events report the *parent* PID in the header.
-    // Prefer the payload ProcessID when present.
-    if let Ok(pid) = parser.try_parse::<u32>("ProcessID") {
-        return pid;
-    }
-    if let Ok(pid) = parser.try_parse::<u32>("ProcessId") {
-        return pid;
-    }
-    if let Ok(pid) = parser.try_parse::<u64>("ProcessID") {
-        return pid as u32;
-    }
-    if let Ok(pid) = parser.try_parse::<u64>("ProcessId") {
-        return pid as u32;
-    }
-    record.process_id()
-}
+impl SensorEventHandler for YaraEventHandler {
+    fn handle_event(&self, event: &SensorEvent) {
+        if event.action != SensorAction::Start {
+            return;
+        }
 
-impl EventHandler for YaraEventHandler {
-    fn handle_event(&self, record: &EventRecord, category: EventCategory) {
-        // We only care about Process Start (OpCode 1) events
-        if category == EventCategory::Process && record.opcode() == 1 {
+        let SensorPayload::Process(fields) = &event.payload else {
+            return;
+        };
+
+        let Some(path) = fields.image.as_deref() else {
             tracing::trace!(
                 target: "scanner",
-                pid = record.process_id(),
-                "YARA ProcessStart event detected"
+                pid = event.pid,
+                "YARA process-start event missing executable path"
             );
+            return;
+        };
 
-            // We use a lightweight parser just to get ImageName
-            if let Ok(schema) =
-                ferrisetw::schema_locator::SchemaLocator::default().event_schema(record)
-            {
-                let parser = Parser::create(record, &schema);
+        let pid = fields
+            .process_id
+            .as_deref()
+            .and_then(|value| value.parse::<u32>().ok())
+            .or(event.pid)
+            .unwrap_or(0);
 
-                // Try to get the ImageName (path)
-                if let Ok(nt_path) = parser.try_parse::<String>("ImageName") {
-                    let pid = extract_process_id(&parser, record);
-                    if pid != record.process_id() {
-                        tracing::trace!(
-                            target: "scanner",
-                            payload_pid = pid,
-                            header_pid = record.process_id(),
-                            "YARA payload PID differs from header PID"
-                        );
-                    }
-                    tracing::trace!(
-                        target: "scanner",
-                        pid = pid,
-                        nt_path = %nt_path,
-                        "YARA extracted NT image path"
-                    );
+        if is_path_allowlisted(path, &self.allowlist_paths) {
+            tracing::trace!(
+                target: "scanner",
+                pid = pid,
+                file = path,
+                "YARA skipping allowlisted path"
+            );
+            return;
+        }
 
-                    // Convert NT Device path to DOS path using shared mapper.
-                    // Handle Win32 prefix before conversion.
-                    let dos_path = normalize_yara_path(&nt_path);
-
-                    if is_path_allowlisted(&dos_path, &self.allowlist_paths) {
-                        tracing::trace!(
-                            target: "scanner",
-                            pid = pid,
-                            file = %dos_path,
-                            "YARA skipping allowlisted path"
-                        );
-                        return;
-                    }
-
-                    tracing::trace!(
-                        target: "scanner",
-                        pid = pid,
-                        file = %dos_path,
-                        "YARA converted path to DOS format"
-                    );
-
-                    // Send to background worker (non-blocking)
-                    match self.tx.try_send((dos_path.clone(), pid)) {
-                        Ok(_) => tracing::trace!(
-                            target: "scanner",
-                            pid = pid,
-                            file = %dos_path,
-                            "YARA queued file for scan"
-                        ),
-                        Err(e) => warn!(
-                            target: "scanner",
-                            pid = pid,
-                            file = %dos_path,
-                            error = %e,
-                            "YARA queue full; dropping scan job"
-                        ),
-                    }
-                } else {
-                    tracing::trace!(
-                        target: "scanner",
-                        pid = record.process_id(),
-                        "YARA failed to parse ImageName from ProcessStart event"
-                    );
-                }
-            }
+        match self.tx.try_send((path.to_string(), pid)) {
+            Ok(_) => tracing::trace!(
+                target: "scanner",
+                pid = pid,
+                file = path,
+                "YARA queued file for scan"
+            ),
+            Err(err) => warn!(
+                target: "scanner",
+                pid = pid,
+                file = path,
+                error = %err,
+                "YARA queue full; dropping scan job"
+            ),
         }
     }
 }
@@ -465,6 +443,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn test_normalize_yara_path_strips_win32_prefix() {
         let input = r"\??\C:\Windows\System32\cmd.exe";
         let normalized = normalize_yara_path(input);
@@ -473,26 +452,49 @@ mod tests {
 
     #[test]
     fn test_normalize_yara_path_passthrough() {
+        // On Windows: a plain DOS path passes through unchanged.
+        // On Linux: all paths pass through unchanged (no NT prefix exists).
+        #[cfg(windows)]
         let input = r"C:\Temp\edrust.exe";
+        #[cfg(not(windows))]
+        let input = "/tmp/edrust";
         let normalized = normalize_yara_path(input);
         assert_eq!(normalized, input);
     }
 
     #[test]
     fn test_normalize_allowlist_paths_adds_trailing_separator() {
-        let paths = vec![r"C:\Windows".to_string()];
-        let normalized = normalize_allowlist_paths(&paths);
-        assert_eq!(normalized, vec![r"c:\windows\".to_string()]);
+        #[cfg(windows)]
+        {
+            let paths = vec![r"C:\Windows".to_string()];
+            let normalized = normalize_allowlist_paths(&paths);
+            assert_eq!(normalized, vec![r"c:\windows\".to_string()]);
+        }
+        #[cfg(not(windows))]
+        {
+            let paths = vec!["/usr/bin".to_string()];
+            let normalized = normalize_allowlist_paths(&paths);
+            assert_eq!(normalized, vec!["/usr/bin/".to_string()]);
+        }
     }
 
     #[test]
     fn test_is_path_allowlisted_matches_prefix() {
-        let allowlist = vec![r"c:\windows\".to_string()];
-        assert!(is_path_allowlisted(
-            r"C:\Windows\System32\cmd.exe",
-            &allowlist
-        ));
-        assert!(!is_path_allowlisted(r"C:\Temp\evil.exe", &allowlist));
+        #[cfg(windows)]
+        {
+            let allowlist = normalize_allowlist_paths(&[r"C:\Windows".to_string()]);
+            assert!(is_path_allowlisted(
+                r"C:\Windows\System32\cmd.exe",
+                &allowlist
+            ));
+            assert!(!is_path_allowlisted(r"C:\Temp\evil.exe", &allowlist));
+        }
+        #[cfg(not(windows))]
+        {
+            let allowlist = normalize_allowlist_paths(&["/usr/bin".to_string()]);
+            assert!(is_path_allowlisted("/usr/bin/curl", &allowlist));
+            assert!(!is_path_allowlisted("/tmp/evil", &allowlist));
+        }
     }
 
     #[test]

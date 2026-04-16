@@ -1,0 +1,23 @@
+[package]
+name = "rustinel-ebpf"
+version = "1.0.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "Rustinel Linux eBPF sensor programs"
+
+[[bin]]
+name = "rustinel-ebpf"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+
+[workspace]
+
+[dependencies]
+aya-ebpf = "0.1"

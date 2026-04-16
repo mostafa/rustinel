@@ -2,183 +2,346 @@ name: CI/CD
 
 on:
   push:
-    branches: [ master, main ]
-    tags: [ 'v*' ]
+    branches: [master, main]
+    tags: ['v*']
   pull_request:
-    branches: [ master, main ]
+    branches: [master, main]
 
 env:
   CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  test:
-    name: Test and Build
-    runs-on: windows-latest
+
+  # ── Format ──────────────────────────────────────────────────────────────────
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          components: rustfmt, clippy
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-
+          components: rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+  # ── Clippy ──────────────────────────────────────────────────────────────────
+  # Run on both platforms so Linux-specific code (aya, libc) and
+  # Windows-specific code (ferrisetw, windows-rs) are each linted natively.
+  clippy-linux:
+    name: Clippy (Linux)
+    runs-on: ubuntu-latest
+    needs: ebpf-build
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Download eBPF artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: rustinel-ebpf-object
+          path: ebpf/
+      - run: cargo clippy --locked --all-targets -- -D warnings
 
-      - name: Run tests
-        run: cargo test --verbose
+  clippy-windows:
+    name: Clippy (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --all-targets -- -D warnings
 
-      - name: Build release
-        run: cargo build --release --verbose
+# ── eBPF Build ──────────────────────────────────────────────────────────────
+  # Produces the BPF bytecode object that is embedded into the Linux binary
+  # at compile time (build.rs looks for ebpf/rustinel-ebpf.o).
+  # The bpfel-unknown-none target is architecture-agnostic, so one artifact
+  # serves both x86_64 and arm64 Linux.
+  ebpf-build:
+    name: Linux eBPF Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup nightly Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly
+          components: rust-src
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache bpf-linker binary
+        id: cache-bpf-linker
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/bpf-linker
+          key: bpf-linker-${{ runner.os }}-${{ hashFiles('ebpf/Cargo.toml') }}
+
+      - name: Install bpf-linker
+        if: steps.cache-bpf-linker.outputs.cache-hit != 'true'
+        run: cargo install bpf-linker
+
+      - name: Build eBPF object
+        run: |
+          cd ebpf
+          cargo build --release
+          cp target/bpfel-unknown-none/release/rustinel-ebpf rustinel-ebpf.o
+
+      - name: Upload eBPF artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: rustinel-ebpf-object
+          path: ebpf/rustinel-ebpf.o
+          retention-days: 1
+
+  # ── Tests ───────────────────────────────────────────────────────────────────
+  test-linux:
+    name: Tests (Linux)
+    runs-on: ubuntu-latest
+    needs: ebpf-build
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Download eBPF artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: rustinel-ebpf-object
+          path: ebpf/
+      - run: cargo test --locked --verbose
+
+  test-windows:
+    name: Tests (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --verbose
+
+  # ── Release Builds ──────────────────────────────────────────────────────────
+  # Only run on version tags; each job uploads a single binary artifact.
+  build-linux-x86_64:
+    name: Build Linux x86_64
+    runs-on: ubuntu-latest
+    needs: ebpf-build
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Download eBPF artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: rustinel-ebpf-object
+          path: ebpf/
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Add target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: Build
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustinel-linux-x86_64
+          path: target/x86_64-unknown-linux-musl/release/rustinel
+          retention-days: 1
+
+  build-linux-arm64:
+    name: Build Linux arm64
+    runs-on: ubuntu-latest
+    needs: ebpf-build
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Download eBPF artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: rustinel-ebpf-object
+          path: ebpf/
+
+      # cross uses Docker (pre-installed on ubuntu-latest) to provide the
+      # aarch64-linux-musl sysroot without any manual toolchain setup.
+      # All deps are pure Rust so no extra cross-compilation wrappers are needed.
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build
+        run: cross build --locked --release --target aarch64-unknown-linux-musl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustinel-linux-arm64
+          path: target/aarch64-unknown-linux-musl/release/rustinel
+          retention-days: 1
+
+  build-windows:
+    name: Build Windows x86_64
+    runs-on: windows-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release
 
       - name: Verify binary
         run: |
           if (!(Test-Path target/release/rustinel.exe)) {
-            Write-Error "Binary not found at target/release/rustinel.exe"
+            Write-Error "Binary not found"
             exit 1
           }
-          $size = (Get-Item target/release/rustinel.exe).Length
-          $sizeMB = [math]::Round($size / 1MB, 2)
-          Write-Output "✓ Binary created successfully"
-          Write-Output "  Size: $sizeMB MB"
-          Write-Output "  Path: target/release/rustinel.exe"
+          $sizeMB = [math]::Round((Get-Item target/release/rustinel.exe).Length / 1MB, 2)
+          Write-Output "Binary: target/release/rustinel.exe ($sizeMB MB)"
 
-      - name: Upload release binary
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: rustinel-binary
+          name: rustinel-windows-x86_64
           path: target/release/rustinel.exe
           retention-days: 1
 
+  # ── Release ─────────────────────────────────────────────────────────────────
   release:
     name: Create Release
-    runs-on: windows-latest
-    needs: test
+    runs-on: ubuntu-latest
+    needs:
+      - fmt
+      - clippy-linux
+      - clippy-windows
+      - test-linux
+      - test-windows
+      - build-linux-x86_64
+      - build-linux-arm64
+      - build-windows
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Download binary artifact
-        uses: actions/download-artifact@v4
+      - name: Download Linux x86_64 binary
+        uses: actions/download-artifact@v7
         with:
-          name: rustinel-binary
-          path: target/release/
+          name: rustinel-linux-x86_64
+          path: dist/linux-x86_64/
+
+      - name: Download Linux arm64 binary
+        uses: actions/download-artifact@v7
+        with:
+          name: rustinel-linux-arm64
+          path: dist/linux-arm64/
+
+      - name: Download Windows x86_64 binary
+        uses: actions/download-artifact@v7
+        with:
+          name: rustinel-windows-x86_64
+          path: dist/windows-x86_64/
 
       - name: Extract version from tag
-        id: get_version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Package Linux x86_64
         run: |
-          $version = "${{ github.ref_name }}" -replace '^v', ''
-          echo "version=$version" >> $env:GITHUB_OUTPUT
-          echo "package_name=rustinel-$version-x86_64-pc-windows-msvc" >> $env:GITHUB_OUTPUT
-          Write-Output "Version: $version"
-          Write-Output "Package: rustinel-$version-x86_64-pc-windows-msvc"
+          PKG="rustinel-${{ steps.version.outputs.version }}-x86_64-unknown-linux-musl"
+          mkdir -p "$PKG/rules/sigma" "$PKG/rules/yara" "$PKG/rules/ioc" "$PKG/logs"
+          cp dist/linux-x86_64/rustinel "$PKG/"
+          chmod +x "$PKG/rustinel"
+          cp config.toml README.md rustinel.service "$PKG/"
+          [[ -d rules/sigma ]] && cp -r rules/sigma/. "$PKG/rules/sigma/" || touch "$PKG/rules/sigma/.gitkeep"
+          [[ -d rules/yara  ]] && cp -r rules/yara/.  "$PKG/rules/yara/"  || touch "$PKG/rules/yara/.gitkeep"
+          [[ -d rules/ioc   ]] && cp -r rules/ioc/.   "$PKG/rules/ioc/"   || touch "$PKG/rules/ioc/.gitkeep"
+          touch "$PKG/logs/.gitkeep"
+          tar czf "$PKG.tar.gz" "$PKG"
 
-      - name: Create package structure
+      - name: Package Linux arm64
         run: |
-          $pkg = "${{ steps.get_version.outputs.package_name }}"
-          Write-Output "Creating package structure: $pkg"
+          PKG="rustinel-${{ steps.version.outputs.version }}-aarch64-unknown-linux-musl"
+          mkdir -p "$PKG/rules/sigma" "$PKG/rules/yara" "$PKG/rules/ioc" "$PKG/logs"
+          cp dist/linux-arm64/rustinel "$PKG/"
+          chmod +x "$PKG/rustinel"
+          cp config.toml README.md rustinel.service "$PKG/"
+          [[ -d rules/sigma ]] && cp -r rules/sigma/. "$PKG/rules/sigma/" || touch "$PKG/rules/sigma/.gitkeep"
+          [[ -d rules/yara  ]] && cp -r rules/yara/.  "$PKG/rules/yara/"  || touch "$PKG/rules/yara/.gitkeep"
+          [[ -d rules/ioc   ]] && cp -r rules/ioc/.   "$PKG/rules/ioc/"   || touch "$PKG/rules/ioc/.gitkeep"
+          touch "$PKG/logs/.gitkeep"
+          tar czf "$PKG.tar.gz" "$PKG"
 
-          # Create main directory
-          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
-
-          # Create subdirectories
-          New-Item -ItemType Directory -Force -Path $pkg/rules/sigma | Out-Null
-          New-Item -ItemType Directory -Force -Path $pkg/rules/yara | Out-Null
-          New-Item -ItemType Directory -Force -Path $pkg/rules/ioc | Out-Null
-          New-Item -ItemType Directory -Force -Path $pkg/logs | Out-Null
-
-          # Copy main files
-          Write-Output "Copying binary..."
-          Copy-Item target/release/rustinel.exe $pkg/
-
-          Write-Output "Copying config..."
-          Copy-Item config.toml $pkg/
-
-          Write-Output "Copying README..."
-          Copy-Item README.md $pkg/
-
-          # Copy example rules if they exist
-          $sigmaRules = Get-ChildItem -Path "rules/sigma/*" -Include *.yml,*.yaml -File -ErrorAction SilentlyContinue
-          if ($sigmaRules) {
-            Write-Output "Copying Sigma rules..."
-            Copy-Item $sigmaRules $pkg/rules/sigma/ -ErrorAction SilentlyContinue
-          } else {
-            Write-Output "No Sigma rules found, creating .gitkeep"
-            New-Item -ItemType File -Path $pkg/rules/sigma/.gitkeep -Force | Out-Null
-          }
-
-          $yaraRules = Get-ChildItem -Path "rules/yara/*" -Include *.yar,*.yara -File -ErrorAction SilentlyContinue
-          if ($yaraRules) {
-            Write-Output "Copying YARA rules..."
-            Copy-Item $yaraRules $pkg/rules/yara/ -ErrorAction SilentlyContinue
-          } else {
-            Write-Output "No YARA rules found, creating .gitkeep"
-            New-Item -ItemType File -Path $pkg/rules/yara/.gitkeep -Force | Out-Null
-          }
-
-          # Copy IOC template files
-          $iocFiles = Get-ChildItem -Path "rules/ioc/*" -Include *.txt -File -ErrorAction SilentlyContinue
-          if ($iocFiles) {
-            Write-Output "Copying IOC template files..."
-            Copy-Item $iocFiles $pkg/rules/ioc/ -ErrorAction SilentlyContinue
-          } else {
-            Write-Output "No IOC files found, creating .gitkeep"
-            New-Item -ItemType File -Path $pkg/rules/ioc/.gitkeep -Force | Out-Null
-          }
-
-          # Create .gitkeep for logs directory
-          New-Item -ItemType File -Path $pkg/logs/.gitkeep -Force | Out-Null
-
-          Write-Output "Package structure created successfully"
-
-      - name: Create ZIP archive
+      - name: Package Windows x86_64
         run: |
-          $pkg = "${{ steps.get_version.outputs.package_name }}"
-          Write-Output "Creating ZIP archive: $pkg.zip"
-          Compress-Archive -Path $pkg -DestinationPath "$pkg.zip" -Force
+          PKG="rustinel-${{ steps.version.outputs.version }}-x86_64-pc-windows-msvc"
+          mkdir -p "$PKG/rules/sigma" "$PKG/rules/yara" "$PKG/rules/ioc" "$PKG/logs"
+          cp dist/windows-x86_64/rustinel.exe "$PKG/"
+          cp config.toml README.md "$PKG/"
+          [[ -d rules/sigma ]] && cp -r rules/sigma/. "$PKG/rules/sigma/" || touch "$PKG/rules/sigma/.gitkeep"
+          [[ -d rules/yara  ]] && cp -r rules/yara/.  "$PKG/rules/yara/"  || touch "$PKG/rules/yara/.gitkeep"
+          [[ -d rules/ioc   ]] && cp -r rules/ioc/.   "$PKG/rules/ioc/"   || touch "$PKG/rules/ioc/.gitkeep"
+          touch "$PKG/logs/.gitkeep"
+          zip -r "$PKG.zip" "$PKG"
 
-          $size = (Get-Item "$pkg.zip").Length
-          $sizeMB = [math]::Round($size / 1MB, 2)
-          Write-Output "✓ ZIP created successfully"
-          Write-Output "  Size: $sizeMB MB"
-          Write-Output "  File: $pkg.zip"
+      - name: Generate SHA256 checksums
+        run: |
+          sha256sum \
+            rustinel-${{ steps.version.outputs.version }}-x86_64-unknown-linux-musl.tar.gz \
+            rustinel-${{ steps.version.outputs.version }}-aarch64-unknown-linux-musl.tar.gz \
+            rustinel-${{ steps.version.outputs.version }}-x86_64-pc-windows-msvc.zip \
+            > rustinel-${{ steps.version.outputs.version }}-checksums-sha256.txt
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.get_version.outputs.package_name }}.zip
+          files: |
+            rustinel-${{ steps.version.outputs.version }}-x86_64-unknown-linux-musl.tar.gz
+            rustinel-${{ steps.version.outputs.version }}-aarch64-unknown-linux-musl.tar.gz
+            rustinel-${{ steps.version.outputs.version }}-x86_64-pc-windows-msvc.zip
+            rustinel-${{ steps.version.outputs.version }}-checksums-sha256.txt
           generate_release_notes: true
           draft: false
           prerelease: false
           name: Rustinel ${{ github.ref_name }}
           body: |
-            ## Installation
+            ## Downloads
 
-            1. Download `${{ steps.get_version.outputs.package_name }}.zip`
-            2. Extract to your desired location
-            3. Review and customize `config.toml`
-            4. Add Sigma rules to `rules/sigma/`
-            5. Add YARA rules to `rules/yara/`
-            6. Populate IOC templates in `rules/ioc/` (hashes.txt, ips.txt, domains.txt, paths_regex.txt)
-            7. Run as Administrator: `.\rustinel.exe run`
+            | Platform | Architecture | Package |
+            |---|---|---|
+            | Linux | x86_64 | `rustinel-${{ steps.version.outputs.version }}-x86_64-unknown-linux-musl.tar.gz` |
+            | Linux | arm64 | `rustinel-${{ steps.version.outputs.version }}-aarch64-unknown-linux-musl.tar.gz` |
+            | Windows | x86_64 | `rustinel-${{ steps.version.outputs.version }}-x86_64-pc-windows-msvc.zip` |
 
-            ## Requirements
+            ## Linux
 
-            - Windows 10/11 or Server 2016+ (x64)
-            - Administrator privileges (required for ETW access)
-            - Rust runtime NOT required (statically linked binary)
+            ```sh
+            tar xzf rustinel-${{ steps.version.outputs.version }}-<arch>.tar.gz
+            cd rustinel-${{ steps.version.outputs.version }}-<arch>
+            # Customize config.toml, add rules to rules/
+            sudo ./rustinel run
+            ```
+
+            A `rustinel.service` systemd unit file is included in the archive for persistent deployment.
+
+            **Requirements:** Linux 5.8+ with BTF enabled, `CAP_BPF` or root.
+
+            ## Windows
+
+            1. Extract the ZIP
+            2. Customize `config.toml`, add rules to `rules/`
+            3. Run as Administrator: `.\rustinel.exe run`
+
+            **Requirements:** Windows 10/11 or Server 2016+ (x64), Administrator privileges.
 
             ## What's Changed
-
-            See auto-generated release notes below.

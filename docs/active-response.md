@@ -1,36 +1,60 @@
 # Active Response
 
-Rustinel includes an optional active response engine that can terminate processes
-when a **critical** alert is raised. It is disabled by default and can run in
-dry-run mode to validate behavior safely.
+Rustinel includes an optional response engine that can terminate processes when an alert reaches the configured minimum severity. It is disabled by default and should be tested in dry-run mode first.
 
 ## Modes
 
-The response engine has three states:
+1. Disabled: no response work is queued.
+2. Dry-run: Rustinel logs what it would do.
+3. Prevention: Rustinel terminates eligible processes.
 
-1. Disabled: no actions are queued.
-2. Dry-run: actions are logged but no process is terminated.
-3. Prevention: eligible processes are terminated.
+## Platform Behavior
+
+| Platform | Action |
+| --- | --- |
+| Windows | Uses process termination APIs |
+| Linux | Sends `SIGKILL` |
 
 ## Severity Handling
 
-- **Sigma**: severity comes from the rule `level` (`low`, `medium`, `high`, `critical`).
-- **YARA**: all matches are treated as `critical`.
+- Sigma uses the rule `level`
+- YARA is always treated as `critical`
+- IOC uses `ioc.default_severity`
 
-The `min_severity` gate applies after this mapping.
-Unknown `min_severity` values default to `critical` and a warning is logged.
+`response.min_severity` is applied after those mappings.
 
 ## Allowlists
 
-Allowlists prevent termination of trusted processes:
+Rustinel will not act on processes that match either of these:
 
-- `allowlist_images`: basenames (e.g. `cmd.exe`) or full paths.
-- `allowlist_paths`: path prefixes (case-insensitive). If unset, inherits from `allowlist.paths`.
+- `allowlist_images`: image basenames or full paths
+- `allowlist_paths`: trusted path prefixes
 
-Shared default trusted path prefixes are configured in `[allowlist].paths`:
-`C:\Windows\`, `C:\Program Files\`, `C:\Program Files (x86)\`.
+By default, `response.allowlist_paths` inherits `allowlist.paths`.
 
-## Configuration
+### Default Trusted Prefixes
+
+#### Windows
+
+- `C:\Windows\`
+- `C:\Program Files\`
+- `C:\Program Files (x86)\`
+
+#### Linux
+
+- `/usr/bin/`
+- `/usr/sbin/`
+- `/usr/lib/`
+- `/usr/lib64/`
+- `/usr/libexec/`
+- `/bin/`
+- `/sbin/`
+- `/lib/`
+- `/lib64/`
+
+## Example Configuration
+
+### Windows
 
 ```toml
 [allowlist]
@@ -44,94 +68,87 @@ paths = [
 enabled = true
 prevention_enabled = false
 min_severity = "critical"
-channel_capacity = 128
 allowlist_images = []
-# Optional module-specific override:
-# allowlist_paths = ["C:\\CustomTrusted\\"]
+```
+
+### Linux
+
+```toml
+[allowlist]
+paths = [
+  "/usr/bin/",
+  "/usr/sbin/",
+]
+
+[response]
+enabled = true
+prevention_enabled = false
+min_severity = "critical"
+allowlist_images = []
 ```
 
 ## Logging
 
-Actions are logged under the `response` target in the operational log:
+Response actions are logged in the operational log:
 
-```
-response: Active response would terminate process pid=4242 image="C:\Temp\evil.exe" dry_run=true
-response: Active response terminated process pid=4242 image="C:\Temp\evil.exe"
-response: Active response skipped: allowlisted pid=4321 image="C:\Windows\System32\cmd.exe"
+```text
+response: Active response would terminate process pid=4242 image="/tmp/evil" dry_run=true
+response: Active response terminated process pid=4242 image="/tmp/evil"
+response: Active response skipped: allowlisted pid=4321 image="/usr/bin/bash"
 ```
 
 ## Safety Checks
 
-The response engine will skip termination if:
+The response engine skips termination when:
 
 - PID is missing
-- PID is `0..4` (system processes)
-- PID is the agent’s own process
-- Image/path is allowlisted
+- PID is in the protected low system range (PIDs 0–4 on both platforms)
+- The target is the Rustinel process itself
+- The process image path is not known
+- The image or path is allowlisted
 
-## Quick Test
+## Safe Test Flow
 
-### Option 1: YARA Demo (Recommended)
+### Cross-Platform YARA Demo
 
-The built-in YARA demo provides the easiest way to test active response:
+1. Enable dry-run mode:
 
-1. Build the demo binary:
-   ```powershell
-   rustc .\examples\yara_demo.rs -o .\examples\yara_demo.exe
-   ```
+```toml
+[response]
+enabled = true
+prevention_enabled = false
+```
 
-2. Enable response in `config.toml`:
-   ```toml
-   [response]
-   enabled = true
-   prevention_enabled = false  # Start with dry-run
-   ```
+2. Start Rustinel.
+3. Build and run the sample binary:
 
-3. Run Rustinel and the demo:
-   ```powershell
-   # Terminal 1: Start Rustinel
-   cargo run -- run --console
+```bash
+rustc ./examples/yara_demo.rs -o ./examples/yara_demo
+./examples/yara_demo
+```
 
-   # Terminal 2: Run the demo
-   .\examples\yara_demo.exe
-   ```
+On Windows:
 
-4. Check logs for dry-run message:
-   ```
-   response: Active response would terminate process pid=XXXX image="...\yara_demo.exe" dry_run=true
-   ```
+```powershell
+rustc .\examples\yara_demo.rs -o .\examples\yara_demo.exe
+.\examples\yara_demo.exe
+```
 
-5. Enable prevention and re-test:
-   ```toml
-   prevention_enabled = true  # Enable termination
-   ```
-   The demo process should be terminated within seconds of starting.
+4. Confirm the operational log shows a dry-run response decision.
+5. After validation, switch `prevention_enabled = true` and repeat.
 
-### Option 2: Custom Sigma Rule
+### Sigma Demo
 
-1. Copy a safe process to a non-allowlisted path:
-   ```powershell
-   New-Item -ItemType Directory -Path C:\Temp -Force | Out-Null
-   Copy-Item C:\Windows\System32\ping.exe C:\Temp\ping-test.exe
-   ```
+Windows:
 
-2. Add a critical Sigma rule:
-   ```yaml
-   title: Local Response Test (Ping)
-   logsource:
-     product: windows
-     category: process_creation
-   detection:
-     selection:
-       Image|endswith: 'ping-test.exe'
-     condition: selection
-   level: critical
-   ```
+```powershell
+whoami /all
+```
 
-3. Run the process:
-   ```powershell
-   C:\Temp\ping-test.exe 127.0.0.1 -t
-   ```
+Linux:
 
-With `prevention_enabled = false`, it will log the action.
-With `prevention_enabled = true`, the process should be terminated quickly.
+```bash
+whoami
+```
+
+These are safe ways to validate the alert-to-response pipeline with the bundled demo rules before introducing custom high-severity content.

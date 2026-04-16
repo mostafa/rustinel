@@ -2,123 +2,212 @@
 
 ## Overview
 
+### Data Plane
+
+```text
+                      ┌───────────────────────────────┐
+                      │ Platform Sensor               │
+                      │ Windows ETW or Linux eBPF     │
+                      └─────────────────┬─────────────┘
+                                        ▼
+                            ┌──────────────────────┐
+                            │ SensorEventRouter    │
+                            └─────────┬─────┬──────┘
+                                      │     │
+                       ┌──────────────┘     └──────────────┐
+                       ▼                                   ▼
+        ┌───────────────────────────┐         ┌──────────────────────┐
+        │ SigmaDetectionHandler     │         │ YaraEventHandler     │
+        │ normalize + Sigma + IOC   │         │ process start only   │
+        │ queue IOC hash jobs       │         └─────────┬────────────┘
+        └──────────┬────────────────┘                   ▼
+                   ▼                        ┌──────────────────────┐
+        ┌───────────────────────────┐       │ YARA worker          │
+        │ Normalizer + shared state │       │ cached file scans    │
+        │ process / SID / DNS / net │       └─────────┬────────────┘
+        └──────┬──────────┬─────────┘                 │
+               ▼          ▼                           │
+      ┌─────────────┐ ┌─────────────┐                 │
+      │ Sigma       │ │ IOC engine  │                 │
+      │ engine      │ │ + hash work │                 │
+      └──────┬──────┘ └──────┬──────┘                 │
+             └─────────┬─────┴───────────────┬────────┘
+                       ▼                     ▼
+                  ┌────────────────────────────┐
+                  │ Detection hit / alert      │
+                  └──────────┬─────────┬───────┘
+                             │         │
+                             ▼         ▼
+                  ┌──────────────┐ ┌──────────────────┐
+                  │ AlertSink    │ │ ResponseEngine   │
+                  │ ECS NDJSON   │ │ optional kill    │
+                  └──────────────┘ └──────────────────┘
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Windows Kernel                          │
-│  (Process, Network, File, Registry, DNS, PowerShell, etc.) │
-└─────────────────────────────────────────────────────────────┘
-                              │ ETW Events
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                      Collector                              │
-│              (ETW providers, event routing)                 │
-└─────────────────────────────────────────────────────────────┘
-                              │ Raw Events
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                     Normalizer                              │
-│        (ETW → Sysmon format, path/user enrichment)         │
-└─────────────────────────────────────────────────────────────┘
-                              │ Normalized Events
-                    ┌─────────┼─────────┐
-                    ▼         ▼         ▼
-         ┌────────────┐ ┌──────────┐ ┌──────────────┐
-         │   Sigma    │ │   YARA   │ │  IOC Engine  │
-         │  (rules)   │ │ (files)  │ │ (indicators) │
-         └────────────┘ └──────────┘ └──────────────┘
-                    │         │         │
-                    └─────────┼─────────┘
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                     Alert Sink                              │
-│               (ECS 9.3.0 NDJSON output)                     │
-└─────────────────────────────────────────────────────────────┘
+
+### Control Plane
+
+```text
+              ┌────────────────────────────────────────┐
+              │ AppConfig                              │
+              │ defaults + config.toml + EDR__* env   │
+              └───────────────┬────────────────────────┘
+                              │
+               ┌──────────────┴──────────────┐
+               ▼                             ▼
+     ┌──────────────────────┐      ┌──────────────────────┐
+     │ Logging setup        │      │ DetectorStore        │
+     │ operational logs +   │      │ Sigma / YARA / IOC   │
+     │ alert output sink    │      │ live detector set    │
+     └──────────────────────┘      └──────────┬───────────┘
+                                               ▲
+                                               │ atomic swap
+                                  ┌────────────┴────────────┐
+                                  │ Reload poller + worker  │
+                                  │ rules/sigma rules/yara  │
+                                  │ rules/ioc/*             │
+                                  └─────────────────────────┘
 ```
 
-## Components
+The key split in the codebase is between the hot event path and the control plane. Raw sensor events stay on a small shared pipeline, while rule loading, reloads, logging setup, and detector replacement happen off to the side.
 
-### Collector
+## Sensor Layer
 
-Manages ETW trace sessions and routes events to handlers.
+### Windows
 
-**ETW Providers:**
-- Microsoft-Windows-Kernel-Process
-- Microsoft-Windows-Kernel-Network
-- Microsoft-Windows-Kernel-File
-- Microsoft-Windows-Kernel-Registry
-- Microsoft-Windows-DNS-Client
-- Microsoft-Windows-PowerShell
-- Microsoft-Windows-WMI-Activity
-- Microsoft-Windows-Service-Control-Manager
-- Microsoft-Windows-TaskScheduler
+The Windows sensor is ETW-based and currently covers:
 
-**Noise Reduction:**
-- Kernel-level keyword filtering excludes read/write operations
-- Router-level filtering drops high-volume network events
+- Process
+- Image load
+- Network
+- File
+- Registry
+- DNS
+- PowerShell
+- WMI
+- Service creation
+- Task creation
 
-### Normalizer
+The ETW providers include:
 
-Converts raw ETW events to Sigma-compatible format.
+- `Microsoft-Windows-Kernel-Process`
+- `Microsoft-Windows-Kernel-Network`
+- `Microsoft-Windows-Kernel-File`
+- `Microsoft-Windows-Kernel-Registry`
+- `Microsoft-Windows-DNS-Client`
+- `Microsoft-Windows-PowerShell`
+- `Microsoft-Windows-WMI-Activity`
+- `Microsoft-Windows-Service-Control-Manager`
+- `Microsoft-Windows-TaskScheduler`
 
-**Enrichment:**
-- NT paths → DOS paths (`\Device\HarddiskVolume2\...` → `C:\...`)
-- PE metadata extraction (OriginalFileName, Product, Description)
-- Parent process correlation
-- SID → Domain\User resolution
-- DNS IP → hostname mapping
-- Process context (`Image`, `CommandLine`, parent metadata) is attached lazily on alerts, not on every normalized event
+### Linux
 
-**Event ID Mapping:**
-| ETW Event | Sysmon or Windows ID |
-|-----------|----------------------|
-| Process Start | 1 |
-| Process Stop | 5 |
-| Image Load | 7 |
-| File Create | 11 |
-| File Delete | 23 |
-| Registry Create/Delete | 12 |
-| Registry SetValue | 13 |
-| Network Connect (TCP/UDP) | 3 |
-| DNS Query | 22 |
-| WMI Event | 19 |
-| PowerShell Script Block | 4104 |
-| Service Creation | 7045 |
-| Task Creation | 106 |
+The Linux sensor loads eBPF programs with Aya and currently covers:
 
-### State Caches
+- Process execution and exit
+- Network connect activity
+- File create, delete, change, and rename flows
+- DNS queries observed from userspace sends; `QueryName` is not extracted in the eBPF program due to BPF verifier complexity limits, so Linux DNS events currently preserve `record_type` and process context but may not have the query name
 
-Thread-safe caches for performance:
+The current loader attaches a mix of tracepoints and kprobes, including:
 
-- **ProcessCache** - Process info with (PID, CreationTime) keys for handling PID reuse
-- **SidCache** - SID → username mappings with async background resolution
-- **DnsCache** - IP → hostname with 15-minute TTL
-- **ConnectionAggregator** - Deduplicates repeated network connections, tracks timing for beacon detection
+- `sched:sched_process_exec`
+- `sched:sched_process_exit`
+- `syscalls:sys_enter_connect`
+- `syscalls:sys_enter_openat`
+- `syscalls:sys_exit_openat`
+- `syscalls:sys_enter_unlinkat`
+- `syscalls:sys_exit_unlinkat`
+- `syscalls:sys_enter_renameat`
+- `syscalls:sys_exit_renameat`
+- `syscalls:sys_enter_renameat2`
+- `syscalls:sys_exit_renameat2`
+- `syscalls:sys_enter_sendto`
+- `kprobe:vfs_create`
 
-### Detection Engines
+Requirements for the Linux sensor are kernel 5.8+, BTF, and eBPF privileges.
 
-**Sigma Engine:**
-- Parses YAML rules with boolean logic
-- Skips unsupported rules at load time (`category`, `product`, `service`)
-- Evaluates only rules in relevant category buckets per event
-- Precompiles condition trees at startup and on hot reload swaps
-- Supports core Sigma modifiers like `contains`, `re`, `cidr`, `base64`, `fieldref`, `windash`
-- Evaluates in real-time per event
+## Shared Pipeline
 
-**YARA Scanner:**
-- Compiles rules at startup and on hot reload swaps
-- Background worker for non-blocking scans
-- Triggers on process creation events
-- Skips allowlisted path prefixes before queueing and in the worker
+Once a platform sensor emits a raw `SensorEvent`, the rest of the runtime is shared:
 
-**IOC Engine:**
-- Matches atomic indicators: hashes (MD5/SHA1/SHA256), IPs/CIDRs, domains (exact + suffix), path regexes
-- Reloads IOC files at runtime with atomic engine swaps
-- Domain, IP, and path checks run inline (negligible overhead with small indicator sets)
-- Hash computation runs in a dedicated `spawn_blocking` worker thread
-- Hash allowlist uses shared `allowlist.paths` by default (or `ioc.hash_allowlist_paths` override)
-- File size limit prevents hashing oversized binaries
-- File identity cache (path + size + mtime) avoids re-hashing unchanged files
+1. `SensorEventRouter` fans each event out to `SigmaDetectionHandler` and `YaraEventHandler`.
+2. `SigmaDetectionHandler` normalizes the event, evaluates Sigma, runs inline IOC checks, and queues process-start hash jobs when IOC hashing is enabled.
+3. `YaraEventHandler` only handles process-start events and queues executable paths to the YARA worker.
+4. YARA scans and IOC hash calculations run off the hot path in background workers.
+5. Detection hits are written as ECS NDJSON through `AlertSink` and can also be handed to `ResponseEngine`.
 
-### Alert Sink
+## Detector Store and Hot Reload
 
-Writes detections to NDJSON files in ECS 9.3.0 format for SIEM ingestion.
+Live detector instances sit behind `DetectorStore`:
+
+- Sigma rules are compiled into the active `Engine`
+- YARA rules are compiled into the active `Scanner`
+- IOC indicator files are loaded into the active `IocEngine`
+
+If hot reload is enabled:
+
+- The poller fingerprints Sigma, YARA, and IOC files on disk
+- The worker debounces changes and rebuilds only the affected detector set
+- Successful rebuilds are swapped in atomically
+- Failed rebuilds keep the previous live detector instances
+
+## Normalization and Enrichment
+
+The normalizer keeps one event model across both platforms and adds context where available:
+
+- Sysmon-style field names in a single `NormalizedEvent` model
+- `ProcessCache` for process metadata and parent correlation
+- `SidCache` for Windows SID-to-user resolution
+- `DnsCache` for DNS answer to later network-event correlation
+- `ConnectionAggregator` for repeated network-connection suppression and interval tracking
+- Lazy process-context enrichment on alerts so non-process detections can still carry process details
+
+On Windows, the agent also snapshots running processes during startup so `ProcessCache` is warm before the first new process event arrives.
+
+## Detection and Response
+
+### Sigma
+
+- Rules are parsed and classified at load time by `product`, `service`, and `category`
+- Conditions are precompiled
+- Rules are bucketed by normalized logsource
+- Unsupported or deferred logsource combinations are skipped at load time
+
+### YARA
+
+- Rules compile at startup and hot reload
+- Scans trigger from process-start events
+- Scanning runs in a background worker
+- Shared allowlists prevent scanning trusted paths
+- Results are cached per file identity with a 10,000-entry cap and a 6-hour TTL
+
+### IOC
+
+- Domains, IPs/CIDRs, path regexes, and file hashes are supported
+- Domain, IP, and path-regex matching runs inline on normalized events
+- File hashing runs in a background worker on process-start events
+- Path allowlists and file-size caps reduce unnecessary hashing
+- Hash results are cached per file identity with a 10,000-entry cap and a 6-hour TTL
+
+### Active Response
+
+- Optional and disabled by default
+- Alerts above the configured threshold are queued to a background worker
+- Windows uses process termination APIs
+- Linux uses `SIGKILL`
+
+## Current Cross-Platform Scope
+
+| Capability | Windows | Linux |
+| --- | --- | --- |
+| Process telemetry | Yes | Yes |
+| Network telemetry | Yes | Yes |
+| File telemetry | Yes | Yes |
+| DNS telemetry | Yes | Yes |
+| Registry telemetry | Yes | No |
+| Image load telemetry | Yes | No |
+| PowerShell telemetry | Yes | No |
+| WMI telemetry | Yes | No |
+| Service telemetry | Yes | No |
+| Task telemetry | Yes | No |
+| Built-in service management | Yes | No |

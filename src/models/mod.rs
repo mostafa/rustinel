@@ -4,6 +4,7 @@
 
 pub mod ecs;
 
+use crate::sensor::Platform;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -12,14 +13,18 @@ use std::collections::HashMap;
 pub struct NormalizedEvent {
     /// Event timestamp
     pub timestamp: String,
+    /// Sensor platform that produced the underlying event.
+    pub platform: Platform,
+    /// Sensor provider name (for example `etw` or `ebpf`).
+    pub provider: String,
     /// Event category (Process, Network, File, Registry, DNS, ImageLoad)
     pub category: EventCategory,
-    /// ETW Event ID (after Kernel->Sysmon mapping)
+    /// Sensor-supplied compatibility event ID used by downstream detectors/output.
     pub event_id: u16,
     /// Cached string representation of event_id for zero-copy flatten()
     #[serde(skip)]
     pub event_id_string: String,
-    /// ETW OpCode (e.g., 1=Start, 2=Stop, 10=ImageLoad)
+    /// Sensor-supplied action code preserved for downstream compatibility logic.
     pub opcode: u8,
     /// Event-specific fields
     pub fields: EventFields,
@@ -144,6 +149,9 @@ pub struct ProcessCreationFields {
 /// File event fields (Sigma: file_access, file_delete, file_event)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEventFields {
+    #[serde(rename = "SourceFilename", skip_serializing_if = "Option::is_none")]
+    pub source_filename: Option<String>,
+
     #[serde(rename = "TargetFilename", skip_serializing_if = "Option::is_none")]
     pub target_filename: Option<String>,
 
@@ -220,6 +228,9 @@ pub struct NetworkConnectionFields {
         skip_serializing_if = "Option::is_none"
     )]
     pub destination_hostname: Option<String>,
+
+    #[serde(rename = "Protocol", skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
 }
 
 /// DNS query event fields (Sigma: dns_query)
@@ -230,6 +241,9 @@ pub struct DnsQueryFields {
 
     #[serde(rename = "QueryResults", skip_serializing_if = "Option::is_none")]
     pub query_results: Option<String>,
+
+    #[serde(rename = "RecordType", skip_serializing_if = "Option::is_none")]
+    pub record_type: Option<String>,
 
     #[serde(rename = "QueryStatus", skip_serializing_if = "Option::is_none")]
     pub query_status: Option<String>,
@@ -437,6 +451,7 @@ impl NormalizedEvent {
                 _ => None,
             },
             EventFields::FileEvent(f) => match key {
+                "SourceFilename" => f.source_filename.as_deref(),
                 "TargetFilename" => f.target_filename.as_deref(),
                 "Image" => f.image.as_deref(),
                 "ProcessId" => f.process_id.as_deref(),
@@ -453,6 +468,7 @@ impl NormalizedEvent {
                 "Image" => f.image.as_deref(),
                 "User" => f.user.as_deref(),
                 "DestinationHostname" => f.destination_hostname.as_deref(),
+                "Protocol" => f.protocol.as_deref(),
                 "ProcessId" => f.process_id.as_deref(),
                 _ => None,
             },
@@ -467,8 +483,12 @@ impl NormalizedEvent {
                 _ => None,
             },
             EventFields::DnsQuery(f) => match key {
+                "query" => f.query_name.as_deref(),
+                "answer" => f.query_results.as_deref(),
+                "record_type" => f.record_type.as_deref(),
                 "QueryName" => f.query_name.as_deref(),
                 "QueryResults" => f.query_results.as_deref(),
+                "RecordType" => f.record_type.as_deref(),
                 "QueryStatus" => f.query_status.as_deref(),
                 "Image" => f.image.as_deref(),
                 "ProcessId" => f.process_id.as_deref(),
@@ -595,6 +615,9 @@ impl NormalizedEvent {
                 }
             }
             EventFields::FileEvent(f) => {
+                if let Some(v) = &f.source_filename {
+                    values.push(v.as_str());
+                }
                 if let Some(v) = &f.target_filename {
                     values.push(v.as_str());
                 }
@@ -636,6 +659,9 @@ impl NormalizedEvent {
                 if let Some(v) = &f.destination_hostname {
                     values.push(v.as_str());
                 }
+                if let Some(v) = &f.protocol {
+                    values.push(v.as_str());
+                }
                 if let Some(v) = &f.process_id {
                     values.push(v.as_str());
                 }
@@ -668,6 +694,9 @@ impl NormalizedEvent {
                     values.push(v.as_str());
                 }
                 if let Some(v) = &f.query_results {
+                    values.push(v.as_str());
+                }
+                if let Some(v) = &f.record_type {
                     values.push(v.as_str());
                 }
                 if let Some(v) = &f.query_status {
@@ -894,6 +923,9 @@ impl NormalizedEvent {
                 }
             }
             EventFields::FileEvent(f) => {
+                if let Some(v) = &f.source_filename {
+                    values.push(("SourceFilename", v.as_str()));
+                }
                 if let Some(v) = &f.target_filename {
                     values.push(("TargetFilename", v.as_str()));
                 }
@@ -935,6 +967,9 @@ impl NormalizedEvent {
                 if let Some(v) = &f.destination_hostname {
                     values.push(("DestinationHostname", v.as_str()));
                 }
+                if let Some(v) = &f.protocol {
+                    values.push(("Protocol", v.as_str()));
+                }
                 if let Some(v) = &f.process_id {
                     values.push(("ProcessId", v.as_str()));
                 }
@@ -964,10 +999,22 @@ impl NormalizedEvent {
             }
             EventFields::DnsQuery(f) => {
                 if let Some(v) = &f.query_name {
+                    values.push(("query", v.as_str()));
+                }
+                if let Some(v) = &f.query_results {
+                    values.push(("answer", v.as_str()));
+                }
+                if let Some(v) = &f.record_type {
+                    values.push(("record_type", v.as_str()));
+                }
+                if let Some(v) = &f.query_name {
                     values.push(("QueryName", v.as_str()));
                 }
                 if let Some(v) = &f.query_results {
                     values.push(("QueryResults", v.as_str()));
+                }
+                if let Some(v) = &f.record_type {
+                    values.push(("RecordType", v.as_str()));
                 }
                 if let Some(v) = &f.query_status {
                     values.push(("QueryStatus", v.as_str()));
@@ -1273,6 +1320,7 @@ pub enum DetectionEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sensor::Platform;
 
     #[test]
     fn test_event_category() {
@@ -1283,6 +1331,8 @@ mod tests {
     fn test_alert_serialization() {
         let event = NormalizedEvent {
             timestamp: "2025-01-01T00:00:00Z".to_string(),
+            platform: Platform::Windows,
+            provider: "etw".to_string(),
             category: EventCategory::Process,
             event_id: 1,
             event_id_string: "1".to_string(),

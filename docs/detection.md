@@ -1,247 +1,193 @@
 # Detection
 
-Rustinel uses three detection engines: Sigma for behavioral rules, YARA for file scanning, and an atomic IOC engine for indicator matching.
+Rustinel has three detector paths:
 
-## Sigma Rules
+- Sigma for behavioral rules on normalized events
+- YARA for executable scans on process-start events
+- IOC for inline indicators plus background file hashing
 
-### Logsource Categories (Required)
+All detection hits are written as ECS NDJSON alerts. The same alerts can also feed the optional response engine.
 
-Rustinel routes rules by `logsource.category` and only loads rules that are relevant to the current Windows ETW pipeline.
-If `category` is missing or unsupported, the rule is skipped at load time.
+## Runtime Flow
 
-`product` and `service` are validated at load time:
-- `product`: empty or `windows` is accepted; others are skipped.
-- `service`: empty or supported Windows services are accepted; unsupported values are skipped.
+| Detector | Input | Execution path | Alert behavior |
+| --- | --- | --- | --- |
+| Sigma | Every normalized event | Inline in `SigmaDetectionHandler` | At most one Sigma alert per event |
+| YARA | Process-start executable path | Background worker via `YaraEventHandler` | One alert per matching YARA rule |
+| IOC domains / IPs / paths | Every normalized event | Inline in `SigmaDetectionHandler` | Zero or more alerts per event |
+| IOC hashes | Process-start executable path | Background worker | Zero or more alerts per file |
 
-Supported categories:
+## Sigma
 
-- `process_creation`
-- `network_connection`
-- `file_event`
-- `file_create`
-- `file_delete`
-- `registry_event`
-- `registry_add`
-- `registry_set`
-- `registry_delete`
-- `dns_query`
-- `image_load`
-- `ps_script`
-- `wmi_event`
-- `service_creation`
-- `task_creation`
+### Rule Loading and Classification
 
-Named-pipe Sigma category `pipe_created` is intentionally unsupported. A dedicated PoC confirmed that the current ETW pipeline does not reliably emit named-pipe object names (`\\.\pipe\...` / `\Device\NamedPipe\...`) in decoded output.
+- Rules load recursively from `scanner.sigma_rules_path`.
+- Multi-document YAML with `action: global` is supported.
+- Rules are classified at load time by normalized `product`, `service`, and `category`.
+- `product` mismatches are skipped.
+- Known Linux service families that are not implemented yet are marked as deferred instead of unknown.
+- Unknown logsource shapes are skipped.
+- Known but inactive collectors can still load for compatibility, but they will not match until the sensor emits that telemetry family.
 
-### Rule Format
+### Supported Logsource Families
 
-```yaml
-title: Suspicious Process
-status: experimental
-logsource:
-  category: process_creation
-detection:
-  selection:
-    Image|endswith: '\\suspicious.exe'
-  filter:
-    User|contains: 'SYSTEM'
-  condition: selection and not filter
-level: high
-```
+| Family | Windows ETW | Linux eBPF | Notes |
+| --- | --- | --- | --- |
+| `process_creation` | Yes | Yes | Sysmon-style process events |
+| `network_connection` | Yes | Yes | Generic `service: connection`, `category: network` is also supported |
+| `file_event` | Yes | Yes | Base file family |
+| `file_create` | Yes | Yes | Derived from file event ID / opcode |
+| `file_delete` | Yes | Yes | Derived from file event ID / opcode |
+| `file_change` | Yes | Yes | Derived from file event ID / opcode |
+| `file_rename` | Yes | Yes | Derived from file event ID / opcode |
+| `dns_query` | Yes | Yes | Generic `category: dns` and `service: dns`, `category: network` are also supported |
+| `registry_event` / `registry_*` | Yes | No | Windows only |
+| `image_load` | Yes | No | Windows only |
+| `ps_script` | Yes | No | Windows only |
+| `wmi_event` | Yes | No | Windows only |
+| `service_creation` | Yes | No | Windows only |
+| `task_creation` | Yes | No | Windows only |
 
-### Detection Logic
+### Field Model
 
-- Boolean operators: `and`, `or`, `not`
-- Parentheses for grouping
-- Aggregation: `1 of selection*`, `all of them`
-- Conditions are transpiled and precompiled at startup and on hot reload (no parsing in the hot event path)
+- Sigma evaluates the shared `NormalizedEvent` model with Sysmon-style field names.
+- Shared process fields include `Image`, `CommandLine`, `User`, `ProcessId`, `ParentImage`, and `ParentCommandLine`.
+- Shared network fields include `DestinationIp`, `DestinationPort`, `SourceIp`, `SourcePort`, and `DestinationHostname`.
+- Shared file fields include `TargetFilename`, `Image`, `ProcessId`, and `User`.
+- DNS rules can use either Sysmon-style names such as `QueryName` and `QueryResults` or the generic aliases `query`, `answer`, and `record_type`.
+
+DNS field availability differs by platform:
+
+| Field | Windows ETW | Linux eBPF |
+| --- | --- | --- |
+| `QueryName` | Yes | No |
+| `QueryResults` | Yes | No |
+| `QueryStatus` | Yes | No |
+| `RecordType` | Yes | Yes |
+| `Image` | Yes | Yes |
+| `ProcessId` | Yes | Yes |
+
+On Linux, the current eBPF DNS path does not extract `QueryName` or `QueryResults`, so generic DNS rules that depend on domain names or resolved answers are much more effective on Windows today.
+
+After a Sigma hit, Rustinel enriches non-process alerts with `process_context` from the process cache when that context is available.
 
 ### Supported Modifiers
 
 | Modifier | Meaning |
-|----------|---------|
+| --- | --- |
 | `contains` | Substring match |
 | `startswith` | Prefix match |
 | `endswith` | Suffix match |
 | `all` | All values must match |
 | `cased` | Case-sensitive match |
 | `re` | Regular expression |
-| `i`, `m`, `s` | Regex flags for `re` (case-insensitive, multiline, dotall) |
-| `windash` | Windows dash normalization (`-` and `/`) |
-| `fieldref` | Reference another field in the same event |
-| `exists` | Field presence check |
+| `i`, `m`, `s` | Regex flags |
+| `windash` | Windows dash normalization |
+| `fieldref` | Compare against another field |
+| `exists` | Field presence or null check |
 | `cidr` | IP range matching |
-| `base64` | Base64-encoded matching |
-| `base64offset` | Base64 with offset variations |
+| `base64` | Base64-encoded match |
+| `base64offset` | Base64 match with offset variations |
 | `wide`, `utf16`, `utf16le`, `utf16be` | UTF-16 transformations |
 | `lt`, `gt`, `le`, `lte`, `ge`, `gte` | Numeric comparison |
 
-Wildcard characters `*` and `?` are supported in string patterns.
+Wildcard `*` and `?` matching is also supported for string patterns.
 
-### Common Fields
+### Match Debug
 
-Process events:
+`alerts.match_debug` controls how much match metadata is attached to Sigma alerts:
 
-- `Image`, `CommandLine`, `User`, `ParentImage`, `ParentCommandLine`
-- `OriginalFileName`, `Product`, `Description`
-- `ProcessId`, `ParentProcessId`, `IntegrityLevel`, `CurrentDirectory`
-- `TargetImage`, `LogonId`, `LogonGuid`
+- `off`: no `match_details`
+- `summary`: adds a short summary, the rule condition, selection results, and matched field or keyword descriptors without the matched field values
+- `full`: adds the matched field values as well
 
-Network events:
+Rustinel truncates long match metadata to keep alerts bounded.
 
-- `DestinationIp`, `DestinationPort`, `SourceIp`, `SourcePort`
-- `DestinationHostname`, `Image`, `ProcessId`, `User`
+### Severity
 
-File events:
+| Sigma Rule Level | Alert Severity |
+| --- | --- |
+| `critical` | Critical |
+| `high` | High |
+| `medium` | Medium |
+| anything else | Low |
 
-- `TargetFilename`, `Image`, `ProcessId`, `User`
-- `CreationUtcTime`, `PreviousCreationUtcTime`
+## YARA
 
-Registry events:
-
-- `TargetObject`, `Details`, `EventType`, `NewName`
-- `Image`, `ProcessId`, `User`
-
-DNS events:
-
-- `QueryName`, `QueryResults`, `QueryStatus`
-- `Image`, `ProcessId`
-
-Image load events:
-
-- `ImageLoaded`, `Image`, `OriginalFileName`, `Product`, `Description`
-- `Signed`, `Signature`, `User`, `ProcessId`
-
-PowerShell script events:
-
-- `ScriptBlockText`, `ScriptBlockId`, `Path`
-- `Image`, `ProcessId`, `User`
-
-WMI events:
-
-- `Operation`, `Query`, `EventNamespace`, `EventType`
-- `DestinationHostname`, `Image`, `ProcessId`, `User`
-
-Service creation events:
-
-- `ServiceName`, `ServiceFileName`, `ServiceType`, `StartType`, `AccountName`
-- `Image`, `ProcessId`, `User`
-
-Task creation events:
-
-- `TaskName`, `TaskContent`, `UserName`
-- `Image`, `ProcessId`, `User`
-
-## YARA Rules
-
-### Rule Format
-
-```yara
-rule ExampleDetection {
-  meta:
-    description = "Detects example malware"
-    severity = "high"
-
-  strings:
-    $s1 = "malicious_string" nocase
-    $s2 = { 4D 5A 90 00 }
-
-  condition:
-    $s1 or $s2
-}
-```
+YARA scanning is shared across both supported platforms.
 
 ### Behavior
 
-- Rules loaded from `rules/yara/` at startup and hot-reloaded on file changes
-- Scans triggered on process creation events
-- File scanning runs in background (non-blocking)
-- Files under allowlisted path prefixes are skipped before queueing and again in the worker
-- Matches generate alerts with the rule name
+- Rules compile from top-level `.yar` and `.yara` files in `scanner.yara_rules_path`.
+- Rule loading is not recursive.
+- Only process-start events queue YARA scans.
+- On Windows, raw ETW paths are normalized before scanning so the worker can open the file.
+- Trusted path prefixes are skipped before queueing and checked again in the worker.
+- Results are cached by file identity with a 10,000-entry cap and a 6-hour TTL.
+- Each matching YARA rule emits its own alert.
 
-### Supported Rule Files
+### Match Debug
 
-- `.yar`
-- `.yara`
+`alerts.match_debug` also affects YARA alerts:
 
-## Atomic IOC Detection
+- `off`: no `match_details`
+- `summary`: includes the matched rule name and structured rule metadata such as tags and namespace
+- `full`: also includes matched string IDs, offsets, and snippets
 
-The IOC engine matches atomic indicators against live events. It supports four indicator types.
-IOC files are loaded at startup and hot-reloaded on file changes.
+### Severity
 
-### Hash IOCs (`rules/ioc/hashes.txt`)
+Every YARA match is emitted as a `critical` alert.
 
-One hash per line, optionally followed by `;comment`. Hash type is auto-detected by length:
+## IOC
 
-- 32 hex chars → MD5
-- 40 hex chars → SHA1
-- 64 hex chars → SHA256
+The IOC engine hot reloads indicator files and splits work between inline event checks and a background hash worker.
 
-```
-0c2674c3a97c53082187d930efb645c2;DEEP PANDA Sakula
-c03318cb12b827c03d556c8747b1e323225df97bdc4258c2756b0d6a4fd52b47;Operation SMN
-```
+### Indicator Types
 
-Hash checking triggers on **process creation only** and runs in a dedicated blocking worker thread.
-Files under allowlisted paths (shared `allowlist.paths` by default, or `ioc.hash_allowlist_paths` override) are skipped.
-Files exceeding `max_file_size_mb` (default: 50 MB) are also skipped.
-A file identity cache avoids re-hashing unchanged binaries.
+| Indicator Type | Source File | Checked Against | Execution Path |
+| --- | --- | --- | --- |
+| Hashes | `rules/ioc/hashes.txt` | Process-start executable path | Background worker |
+| IPs / CIDRs | `rules/ioc/ips.txt` | Network source and destination IPs, plus IPs parsed from DNS answers | Inline |
+| Domains | `rules/ioc/domains.txt` | DNS `QueryName`, network `DestinationHostname`, WMI `DestinationHostname` | Inline |
+| Path regexes | `rules/ioc/paths_regex.txt` | `ProcessCreation.Image`, `ProcessCreation.TargetImage`, `FileEvent.TargetFilename`, `ImageLoad.ImageLoaded`, `PowerShellScript.Path`, `ServiceCreation.ServiceFileName` | Inline |
 
-### IP/CIDR IOCs (`rules/ioc/ips.txt`)
+### Runtime Notes
 
-One IP or CIDR per line:
+- Hashing only runs when at least one hash IOC is loaded.
+- Hashing is triggered from process-start events.
+- Trusted path prefixes and `ioc.max_file_size_mb` are enforced before hashing.
+- Hash results are cached by file identity with a 10,000-entry cap and a 6-hour TTL.
+- Inline IOC matching can emit multiple alerts from a single event.
 
-```
-203.0.113.1;C2 endpoint
-10.10.0.0/16;Lab range
-```
-
-Checked against `DestinationIp`, `SourceIp` (network events) and `QueryResults` (DNS events).
-
-### Domain IOCs (`rules/ioc/domains.txt`)
-
-One domain per line. Prefix with `.` or `*.` for suffix matching:
-
-```
-evil.example.com;Exact match
-*.example.org;All subdomains
-```
-
-Checked against `QueryName` (DNS), `DestinationHostname` (network/WMI).
-
-### Path Regex IOCs (`rules/ioc/paths_regex.txt`)
-
-One regex per line, compiled case-insensitive:
-
-```
-^C:\\Users\\Public\\.*\.exe$;Suspicious drop path
-.*\\AppData\\Roaming\\.*\\update\.exe$;Common malware pattern
-# Note: use \\ for path separators (literal backslash), \. for literal dot
-```
-
-Checked against `Image`, `TargetFilename`, `ImageLoaded`, `ServiceFileName`, and PowerShell `Path` fields.
-Patterns are compiled into a `RegexSet` for efficient multi-pattern matching.
+Windows currently has much better IOC coverage for domains and DNS-answer IPs because its DNS events carry `QueryName` and `QueryResults`. Linux eBPF DNS events do not currently populate those fields.
 
 ### IOC File Format
 
-All IOC files share the same format:
+- Lines beginning with `#` or `//` are comments.
+- Empty lines are ignored.
+- `;comment` suffixes are optional.
+- Hashes are auto-detected by length as MD5, SHA1, or SHA256.
+- Domain entries without a leading `.` are exact matches.
+- Domain entries with a leading `.` match the suffix and all subdomains.
+- Domain entries with a leading `*.` are normalized to suffix matching.
+- Path regexes are compiled case-insensitive.
 
-- Lines starting with `#` or `//` are comments
-- Empty lines are ignored
-- Values and comments are separated by `;`
+Example:
 
-### IOC Alerts
+```text
+203.0.113.1;C2 endpoint
+.example.org;Suspicious zone
+^/tmp/evil(/.*)?$;Linux staging path
+```
 
-IOC alerts use `rule.engine: "Ioc"` and follow the naming convention `ioc:<type>:<indicator>`.
-The default severity is configurable via `ioc.default_severity` (default: `high`).
+### Severity
 
-## Severity Levels
+`ioc.default_severity` maps IOC alerts to `critical`, `high`, `medium`, or `low`. Unknown values fall back to `high`.
 
-Sigma `level` values map to alert severity as follows:
+## Overall Severity Mapping
 
-- `critical` -> Critical
-- `high` -> High
-- `medium` -> Medium
-- Any other value -> Low
-
-YARA matches are always treated as Critical.
+| Detector | Severity Behavior |
+| --- | --- |
+| Sigma | Uses the rule `level` with `critical`, `high`, and `medium` mapped explicitly; everything else becomes Low |
+| YARA | Every match is Critical |
+| IOC | Uses `ioc.default_severity` |

@@ -1,10 +1,10 @@
-//! Rustinel: Rust ETW Sentinel
+//! Rustinel: Open-source EDR for Windows and Linux, written in Rust.
 //!
-//! High-performance, memory-safe Windows endpoint detection agent.
-//! Replicates YAMAGoya functionality without .NET runtime dependencies.
+//! On Windows, telemetry is collected via ETW. On Linux, eBPF programs are
+//! loaded via Aya. Both paths feed a shared userspace pipeline for Sigma,
+//! YARA, and IOC detection, with alerts written as ECS NDJSON.
 
 mod alerts;
-mod collector;
 mod config;
 mod engine;
 mod ioc;
@@ -13,33 +13,63 @@ mod normalizer;
 mod reload;
 mod response;
 mod scanner;
+mod sensor;
 mod state;
 mod utils;
 
+// ── Platform-shared imports ───────────────────────────────────────────────────
+#[cfg(any(windows, target_os = "linux"))]
 use alerts::AlertSink;
-use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use collector::{Collector, EventRouter};
+#[cfg(any(windows, target_os = "linux"))]
 use engine::{Engine, SigmaDetectionHandler};
+#[cfg(any(windows, target_os = "linux"))]
 use ioc::{HashCache, HashRequirements, IocEngine};
+#[cfg(any(windows, target_os = "linux"))]
 use models::{
     Alert, AlertSeverity, DetectionEngine, EventCategory, EventFields, MatchDebugLevel,
     MatchDetails, NormalizedEvent, ProcessCreationFields, YaraMatchDetails, YaraRuleMatch,
 };
+#[cfg(any(windows, target_os = "linux"))]
 use normalizer::Normalizer;
+#[cfg(any(windows, target_os = "linux"))]
 use reload::DetectorStore;
+#[cfg(any(windows, target_os = "linux"))]
 use response::ResponseEngine;
+#[cfg(any(windows, target_os = "linux"))]
 use scanner::YaraEventHandler;
+#[cfg(any(windows, target_os = "linux"))]
+use sensor::{Platform, Sensor, SensorEvent, SensorEventRouter};
+#[cfg(any(windows, target_os = "linux"))]
 use state::{ConnectionAggregator, DnsCache, ProcessCache, SidCache};
+#[cfg(any(windows, target_os = "linux"))]
+use std::fs;
+#[cfg(any(windows, target_os = "linux"))]
 use std::path::Path;
+#[cfg(any(windows, target_os = "linux"))]
 use std::sync::Arc;
+#[cfg(any(windows, target_os = "linux"))]
 use std::time::Duration;
-use tokio::runtime::Builder;
-use tokio::sync::{mpsc, watch};
+#[cfg(any(windows, target_os = "linux"))]
 use tracing::{debug, error, info, warn};
+#[cfg(any(windows, target_os = "linux"))]
 use tracing_appender::rolling;
+#[cfg(any(windows, target_os = "linux"))]
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+#[cfg(any(windows, target_os = "linux"))]
 use utils::LogRateLimiter;
+
+// ── Platform-specific imports ─────────────────────────────────────────────────
+#[cfg(windows)]
+use sensor::windows::EtwSensor;
+#[cfg(windows)]
+use tokio::runtime::Builder;
+#[cfg(windows)]
+use tokio::sync::{mpsc, watch};
+
+#[cfg(target_os = "linux")]
+use sensor::linux::EbpfSensor;
+#[cfg(target_os = "linux")]
+use tokio::sync::mpsc;
 
 #[cfg(windows)]
 const SERVICE_NAME: &str = "Rustinel";
@@ -47,10 +77,17 @@ const SERVICE_NAME: &str = "Rustinel";
 const SERVICE_DISPLAY_NAME: &str = "Rustinel ETW Sentinel";
 #[cfg(windows)]
 const SERVICE_DESCRIPTION: &str = "High-performance endpoint detection agent";
-const WORKER_DEBUG_LOG_WINDOW_SECS: u64 = 30;
 
-#[derive(Parser)]
+#[cfg(any(windows, target_os = "linux"))]
+const WORKER_DEBUG_LOG_WINDOW_SECS: u64 = 30;
+#[cfg(any(windows, target_os = "linux"))]
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+#[cfg(any(windows, target_os = "linux"))]
+const STARTUP_BANNER_INNER_WIDTH: usize = 49;
+
+#[derive(clap::Parser)]
 #[command(name = "rustinel")]
+#[command(version)]
 #[command(about = "High-Performance Rust EDR", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -60,7 +97,7 @@ struct Cli {
     log_level: Option<String>,
 }
 
-#[derive(Subcommand)]
+#[derive(clap::Subcommand)]
 enum Commands {
     /// Run in console mode (foreground)
     Run {
@@ -75,7 +112,7 @@ enum Commands {
     },
 }
 
-#[derive(Subcommand, Copy, Clone)]
+#[derive(clap::Subcommand, Copy, Clone)]
 enum ServiceAction {
     Install,
     Uninstall,
@@ -83,17 +120,17 @@ enum ServiceAction {
     Stop,
 }
 
+#[cfg(windows)]
 enum ShutdownMode {
     Console,
     Service(watch::Receiver<bool>),
 }
 
-fn main() -> Result<()> {
-    #[cfg(windows)]
-    {
-        if windows_service::service_dispatcher::start(SERVICE_NAME, ffi_service_main).is_ok() {
-            return Ok(());
-        }
+#[cfg(windows)]
+fn main() -> anyhow::Result<()> {
+    use clap::Parser;
+    if windows_service::service_dispatcher::start(SERVICE_NAME, ffi_service_main).is_ok() {
+        return Ok(());
     }
 
     let cli = Cli::parse();
@@ -105,13 +142,40 @@ fn main() -> Result<()> {
     }
 }
 
-fn run_console(force_console: bool, log_level: Option<String>) -> Result<()> {
+#[cfg(target_os = "linux")]
+fn main() -> anyhow::Result<()> {
+    use clap::Parser;
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Commands::Service { action }) => handle_service_command(action),
+        Some(Commands::Run { .. }) | None => run_linux(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux() -> anyhow::Result<()> {
+    use tokio::runtime::Builder;
+    let runtime = Builder::new_multi_thread().enable_all().build()?;
+    runtime.block_on(run_linux_edr())
+}
+
+// Catch-all for non-Windows, non-Linux platforms.
+#[cfg(not(any(windows, target_os = "linux")))]
+fn main() -> anyhow::Result<()> {
+    Err(anyhow::anyhow!(
+        "This platform is not supported. Rustinel runs on Windows (ETW) and Linux (eBPF)."
+    ))
+}
+
+#[cfg(windows)]
+fn run_console(force_console: bool, log_level: Option<String>) -> anyhow::Result<()> {
     let runtime = Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(run_edr(ShutdownMode::Console, force_console, log_level))
 }
 
 #[cfg(windows)]
-fn handle_service_command(action: ServiceAction) -> Result<()> {
+fn handle_service_command(action: ServiceAction) -> anyhow::Result<()> {
     match action {
         ServiceAction::Install => install_service(),
         ServiceAction::Uninstall => uninstall_service(),
@@ -121,14 +185,14 @@ fn handle_service_command(action: ServiceAction) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn handle_service_command(_action: ServiceAction) -> Result<()> {
+fn handle_service_command(_action: ServiceAction) -> anyhow::Result<()> {
     Err(anyhow::anyhow!(
         "Service commands are only supported on Windows"
     ))
 }
 
 #[cfg(windows)]
-fn install_service() -> Result<()> {
+fn install_service() -> anyhow::Result<()> {
     use std::env;
     use std::ffi::OsString;
     use windows_service::service::{
@@ -160,7 +224,7 @@ fn install_service() -> Result<()> {
 }
 
 #[cfg(windows)]
-fn uninstall_service() -> Result<()> {
+fn uninstall_service() -> anyhow::Result<()> {
     use windows_service::service::ServiceAccess;
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
@@ -172,7 +236,7 @@ fn uninstall_service() -> Result<()> {
 }
 
 #[cfg(windows)]
-fn start_service() -> Result<()> {
+fn start_service() -> anyhow::Result<()> {
     use windows_service::service::ServiceAccess;
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
@@ -184,7 +248,7 @@ fn start_service() -> Result<()> {
 }
 
 #[cfg(windows)]
-fn stop_service() -> Result<()> {
+fn stop_service() -> anyhow::Result<()> {
     use windows_service::service::ServiceAccess;
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
@@ -203,7 +267,7 @@ extern "system" fn ffi_service_main(_args: u32, _raw_args: *mut *mut u16) {
 }
 
 #[cfg(windows)]
-fn service_main() -> Result<()> {
+fn service_main() -> anyhow::Result<()> {
     use std::time::Duration;
     use windows_service::service::{
         ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
@@ -293,8 +357,10 @@ fn service_main() -> Result<()> {
     result
 }
 
-/// Initialize dual-pipeline logging system
-/// Returns WorkerGuards that MUST be kept alive for the duration of the program
+// ── Shared logging helpers ────────────────────────────────────────────────────
+
+/// Build an `EnvFilter` from the logging configuration, with fallback to `info`.
+#[cfg(any(windows, target_os = "linux"))]
 fn build_log_filter(logging: &config::LogConfig) -> EnvFilter {
     if let Some(raw_filter) = logging.filter.as_deref() {
         let filter = raw_filter.trim();
@@ -323,6 +389,27 @@ fn build_log_filter(logging: &config::LogConfig) -> EnvFilter {
     }
 }
 
+#[cfg(any(windows, target_os = "linux"))]
+fn log_startup_banner(runtime: &str) {
+    info!(target: "rustinel", "╔═══════════════════════════════════════════════════╗");
+    info!(
+        target: "rustinel",
+        "║ {:^width$} ║",
+        format!("Rustinel v{} ({})", APP_VERSION, runtime),
+        width = STARTUP_BANNER_INNER_WIDTH
+    );
+    info!(
+        target: "rustinel",
+        "║ {:^width$} ║",
+        "High-Performance Endpoint Detection Agent",
+        width = STARTUP_BANNER_INNER_WIDTH
+    );
+    info!(target: "rustinel", "╚═══════════════════════════════════════════════════╝");
+}
+
+/// Initialize dual-pipeline logging system.
+/// Returns WorkerGuards that MUST be kept alive for the duration of the program.
+#[cfg(windows)]
 fn init_logging(
     cfg: &config::AppConfig,
 ) -> (
@@ -330,23 +417,9 @@ fn init_logging(
     tracing_appender::non_blocking::WorkerGuard,
     AlertSink,
 ) {
-    if let Err(err) = std::fs::create_dir_all(&cfg.logging.directory)
-        .with_context(|| format!("Failed to create log directory {:?}", cfg.logging.directory))
-    {
-        eprintln!("{}", err);
-    }
-    if let Err(err) = std::fs::create_dir_all(&cfg.alerts.directory).with_context(|| {
-        format!(
-            "Failed to create alerts directory {:?}",
-            cfg.alerts.directory
-        )
-    }) {
-        eprintln!("{}", err);
-    }
-
     // 1. Operational Logs (Human Readable Text)
-    let app_file = rolling::daily(&cfg.logging.directory, &cfg.logging.filename);
-    let (app_writer, app_guard) = tracing_appender::non_blocking(app_file);
+    let (app_writer, app_guard) =
+        build_daily_writer("operational", &cfg.logging.directory, &cfg.logging.filename);
     let base_filter = build_log_filter(&cfg.logging);
 
     let app_layer = fmt::layer()
@@ -354,18 +427,23 @@ fn init_logging(
         .compact()
         .with_ansi(false)
         .with_target(true)
-        .with_filter(base_filter.clone()); // Respect configured filter/level
+        .with_filter(base_filter.clone());
 
     // 2. Security Alerts (ECS NDJSON)
-    let alert_file = rolling::daily(&cfg.alerts.directory, &cfg.alerts.filename);
-    let (alert_writer, alert_guard) = tracing_appender::non_blocking(alert_file);
+    let (alert_writer, alert_guard) =
+        build_daily_writer("alerts", &cfg.alerts.directory, &cfg.alerts.filename);
     let alert_sink = AlertSink::new(alert_writer);
 
     // 3. Console (Optional, for Dev)
+    // ANSI color codes are only rendered correctly on Windows Terminal (WT_SESSION env var is set).
+    // Fall back to plain text in other terminals (cmd.exe, PowerShell host, etc.) to avoid
+    // raw escape sequences appearing in the output.
+    let ansi_supported = std::env::var("WT_SESSION").is_ok();
     let console_layer = if cfg.logging.console_output {
         Some(
             fmt::layer()
                 .compact()
+                .with_ansi(ansi_supported)
                 .with_target(false) // Hide target for cleaner output
                 .with_filter(base_filter),
         )
@@ -380,6 +458,197 @@ fn init_logging(
 
     (app_guard, alert_guard, alert_sink)
 }
+
+#[cfg(target_os = "linux")]
+fn init_logging(
+    cfg: &config::AppConfig,
+) -> (
+    tracing_appender::non_blocking::WorkerGuard,
+    tracing_appender::non_blocking::WorkerGuard,
+    AlertSink,
+) {
+    let (app_writer, app_guard) =
+        build_daily_writer("operational", &cfg.logging.directory, &cfg.logging.filename);
+    let base_filter = build_log_filter(&cfg.logging);
+
+    let app_layer = fmt::layer()
+        .with_writer(app_writer)
+        .compact()
+        .with_ansi(false)
+        .with_target(true)
+        .with_filter(base_filter.clone());
+
+    let (alert_writer, alert_guard) =
+        build_daily_writer("alerts", &cfg.alerts.directory, &cfg.alerts.filename);
+
+    if cfg.logging.console_output {
+        let console_layer = fmt::layer()
+            .compact()
+            .with_ansi(true)
+            .with_target(true)
+            .with_filter(base_filter);
+        tracing_subscriber::registry()
+            .with(app_layer)
+            .with(console_layer)
+            .init();
+    } else {
+        tracing_subscriber::registry().with(app_layer).init();
+    }
+
+    (app_guard, alert_guard, AlertSink::new(alert_writer))
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn build_daily_writer(
+    label: &str,
+    directory: &Path,
+    filename: &str,
+) -> (
+    tracing_appender::non_blocking::NonBlocking,
+    tracing_appender::non_blocking::WorkerGuard,
+) {
+    if let Some(writer) = try_build_daily_writer(label, directory, filename) {
+        return writer;
+    }
+
+    let fallback_directory = std::env::temp_dir().join("rustinel-logs");
+    if let Some(writer) = try_build_daily_writer(label, &fallback_directory, filename) {
+        eprintln!(
+            "Falling back to {:?} for {} logs",
+            fallback_directory, label
+        );
+        return writer;
+    }
+
+    eprintln!(
+        "Unable to initialize {} file logging; using a sink writer instead",
+        label
+    );
+    tracing_appender::non_blocking(std::io::sink())
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn try_build_daily_writer(
+    label: &str,
+    directory: &Path,
+    filename: &str,
+) -> Option<(
+    tracing_appender::non_blocking::NonBlocking,
+    tracing_appender::non_blocking::WorkerGuard,
+)> {
+    if let Err(err) = fs::create_dir_all(directory) {
+        eprintln!(
+            "Unable to create {} log directory {:?}: {}",
+            label, directory, err
+        );
+        return None;
+    }
+
+    match rolling::RollingFileAppender::builder()
+        .rotation(rolling::Rotation::DAILY)
+        .filename_prefix(filename)
+        .build(directory)
+    {
+        Ok(appender) => Some(tracing_appender::non_blocking(appender)),
+        Err(err) => {
+            eprintln!(
+                "Unable to initialize {} rolling log appender in {:?}: {}",
+                label, directory, err
+            );
+            None
+        }
+    }
+}
+
+// ── Shared YARA helpers ───────────────────────────────────────────────────────
+
+#[cfg(any(windows, target_os = "linux"))]
+fn build_yara_match_details(
+    match_debug: MatchDebugLevel,
+    rule_match: &YaraRuleMatch,
+) -> Option<MatchDetails> {
+    if matches!(match_debug, MatchDebugLevel::Off) {
+        return None;
+    }
+
+    let summary = if matches!(match_debug, MatchDebugLevel::Full) {
+        if let Some(first_string) = rule_match.strings.first() {
+            if let Some(offset) = first_string.offset {
+                format!(
+                    "matched YARA rule {} via {} at 0x{:x}",
+                    rule_match.rule, first_string.id, offset
+                )
+            } else {
+                format!(
+                    "matched YARA rule {} via {}",
+                    rule_match.rule, first_string.id
+                )
+            }
+        } else {
+            format!("matched YARA rule {}", rule_match.rule)
+        }
+    } else {
+        format!("matched YARA rule {}", rule_match.rule)
+    };
+
+    let mut rule = rule_match.clone();
+    if !matches!(match_debug, MatchDebugLevel::Full) {
+        rule.strings.clear();
+    }
+
+    Some(MatchDetails {
+        summary,
+        sigma: None,
+        yara: Some(YaraMatchDetails { rules: vec![rule] }),
+    })
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn build_yara_alert(
+    rule_name: &str,
+    path: &str,
+    pid: u32,
+    match_details: Option<MatchDetails>,
+    platform: Platform,
+    provider: &str,
+) -> Alert {
+    Alert {
+        severity: AlertSeverity::Critical,
+        rule_name: rule_name.to_string(),
+        rule_description: None,
+        engine: DetectionEngine::Yara,
+        event: NormalizedEvent {
+            timestamp: utils::now_timestamp_string(),
+            platform,
+            provider: provider.to_string(),
+            category: EventCategory::Process,
+            event_id: 1,
+            event_id_string: "1".to_string(),
+            opcode: 1,
+            fields: EventFields::ProcessCreation(ProcessCreationFields {
+                image: Some(path.to_string()),
+                original_file_name: None,
+                product: None,
+                description: None,
+                target_image: None,
+                command_line: None,
+                process_id: Some(pid.to_string()),
+                parent_process_id: None,
+                parent_image: None,
+                parent_command_line: None,
+                current_directory: None,
+                integrity_level: None,
+                user: None,
+                logon_id: None,
+                logon_guid: None,
+            }),
+            process_context: None,
+        },
+        match_details,
+    }
+}
+
+// ── Windows ETW EDR ───────────────────────────────────────────────────────────
 
 // Native API FFI structures for NtQuerySystemInformation
 #[cfg(windows)]
@@ -548,7 +817,7 @@ mod native_snapshot {
 /// Snapshot all running processes using Native API (NtQuerySystemInformation)
 /// This provides accurate CreateTime values that match ETW events
 #[cfg(windows)]
-fn snapshot_processes(cache: &ProcessCache) -> Result<usize> {
+fn snapshot_processes(cache: &ProcessCache) -> anyhow::Result<usize> {
     use utils::{convert_nt_to_dos, parse_metadata};
 
     let processes = native_snapshot::query_system_processes()
@@ -599,96 +868,17 @@ fn snapshot_processes(cache: &ProcessCache) -> Result<usize> {
     Ok(count)
 }
 
-fn build_yara_match_details(
-    match_debug: MatchDebugLevel,
-    rule_match: &YaraRuleMatch,
-) -> Option<MatchDetails> {
-    if matches!(match_debug, MatchDebugLevel::Off) {
-        return None;
-    }
-
-    let summary = if matches!(match_debug, MatchDebugLevel::Full) {
-        if let Some(first_string) = rule_match.strings.first() {
-            if let Some(offset) = first_string.offset {
-                format!(
-                    "matched YARA rule {} via {} at 0x{:x}",
-                    rule_match.rule, first_string.id, offset
-                )
-            } else {
-                format!(
-                    "matched YARA rule {} via {}",
-                    rule_match.rule, first_string.id
-                )
-            }
-        } else {
-            format!("matched YARA rule {}", rule_match.rule)
-        }
-    } else {
-        format!("matched YARA rule {}", rule_match.rule)
-    };
-
-    let mut rule = rule_match.clone();
-    if !matches!(match_debug, MatchDebugLevel::Full) {
-        rule.strings.clear();
-    }
-
-    Some(MatchDetails {
-        summary,
-        sigma: None,
-        yara: Some(YaraMatchDetails { rules: vec![rule] }),
-    })
-}
-
-fn build_yara_alert(
-    rule_name: &str,
-    path: &str,
-    pid: u32,
-    match_details: Option<MatchDetails>,
-) -> Alert {
-    Alert {
-        severity: AlertSeverity::Critical,
-        rule_name: rule_name.to_string(),
-        rule_description: None,
-        engine: DetectionEngine::Yara,
-        event: NormalizedEvent {
-            timestamp: utils::now_timestamp_string(),
-            category: EventCategory::Process,
-            event_id: 1,
-            event_id_string: "1".to_string(),
-            opcode: 1,
-            fields: EventFields::ProcessCreation(ProcessCreationFields {
-                image: Some(path.to_string()),
-                original_file_name: None,
-                product: None,
-                description: None,
-                target_image: None,
-                command_line: None,
-                process_id: Some(pid.to_string()),
-                parent_process_id: None,
-                parent_image: None,
-                parent_command_line: None,
-                current_directory: None,
-                integrity_level: None,
-                user: None,
-                logon_id: None,
-                logon_guid: None,
-            }),
-            process_context: None,
-        },
-        match_details,
-    }
-}
-
+#[cfg(windows)]
 fn spawn_shutdown_handler(
     shutdown_mode: ShutdownMode,
-    collector: Arc<Collector>,
+    sensor: Arc<EtwSensor>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         match shutdown_mode {
             ShutdownMode::Console => match tokio::signal::ctrl_c().await {
                 Ok(()) => {
                     info!("Received Ctrl+C signal");
-                    collector.shutdown();
+                    sensor.shutdown();
                 }
                 Err(err) => {
                     error!("Failed to listen for Ctrl+C: {}", err);
@@ -700,17 +890,18 @@ fn spawn_shutdown_handler(
                 } else {
                     warn!("Service shutdown channel dropped");
                 }
-                collector.shutdown();
+                sensor.shutdown();
             }
         }
     })
 }
 
+#[cfg(windows)]
 async fn run_edr(
     shutdown_mode: ShutdownMode,
     force_console: bool,
     log_level_override: Option<String>,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     // 1. Load Configuration
     let mut cfg = match config::AppConfig::new() {
         Ok(cfg) => cfg,
@@ -733,10 +924,7 @@ async fn run_edr(
     let (app_guard, alert_guard, alert_sink) = init_logging(&cfg);
     let _guards = (app_guard, alert_guard);
 
-    info!(target: "rustinel", "╔═══════════════════════════════════════════════════╗");
-    info!(target: "rustinel", "║       Rustinel ETW Sentinel v0.1.0                ║");
-    info!(target: "rustinel", "║   High-Performance Endpoint Detection Agent       ║");
-    info!(target: "rustinel", "╚═══════════════════════════════════════════════════╝");
+    log_startup_banner("Windows ETW");
 
     // 2.1 Initialize Active Response Engine (optional)
     let (response_engine, response_worker_handle) = ResponseEngine::new(&cfg.response);
@@ -822,11 +1010,14 @@ async fn run_edr(
         info!("Process snapshot not available on non-Windows platforms");
     }
 
-    let collector = Arc::new(Collector::new());
+    let sensor = Arc::new(EtwSensor::new());
 
     // Initialize Sigma engine
-    let mut sigma_engine =
-        Engine::new_with_logging_level_and_match_debug(&cfg.logging.level, cfg.alerts.match_debug);
+    let mut sigma_engine = Engine::new_for_platform_with_logging_level_and_match_debug(
+        Platform::Windows,
+        &cfg.logging.level,
+        cfg.alerts.match_debug,
+    );
 
     if cfg.scanner.sigma_enabled {
         info!(
@@ -842,13 +1033,14 @@ async fn run_edr(
             info!(
                 target: "rustinel",
                 total_rules = stats.total_rules,
-                skipped_category_rules = stats.skipped_category_rules,
+                skipped_deferred_rules = stats.skipped_deferred_rules,
+                skipped_unknown_logsource_rules = stats.skipped_unknown_logsource_rules,
                 skipped_product_rules = stats.skipped_product_rules,
-                skipped_service_rules = stats.skipped_service_rules,
+                inactive_collector_rules = stats.inactive_collector_rules,
                 "Sigma Engine initialized"
             );
-            for (category, count) in stats.rules_by_category {
-                info!(target: "rustinel", category = %category, count = count, "Sigma rules loaded");
+            for (logsource, count) in stats.rules_by_logsource {
+                info!(target: "rustinel", logsource = %logsource, count = count, "Sigma rules loaded");
             }
         }
     } else {
@@ -1000,8 +1192,14 @@ async fn run_edr(
                         // ECS NDJSON output
                         for rule_match in &matches {
                             let match_details = build_yara_match_details(match_debug, rule_match);
-                            let alert =
-                                build_yara_alert(&rule_match.rule, &path, pid, match_details);
+                            let alert = build_yara_alert(
+                                &rule_match.rule,
+                                &path,
+                                pid,
+                                match_details,
+                                Platform::Windows,
+                                "etw",
+                            );
                             alert_sink_for_yara.write_alert(&alert);
                             response_engine_for_yara.handle_alert(&alert);
                         }
@@ -1136,7 +1334,13 @@ async fn run_edr(
                         "IOC hash match detected"
                     );
                     for m in matches {
-                        let alert = ioc_engine.build_alert_for_hash_match(&m, &path, pid);
+                        let alert = ioc_engine.build_alert_for_hash_match(
+                            &m,
+                            &path,
+                            pid,
+                            Platform::Windows,
+                            "etw",
+                        );
                         alert_sink_for_ioc.write_alert(&alert);
                         response_engine_for_ioc.handle_alert(&alert);
                     }
@@ -1166,7 +1370,7 @@ async fn run_edr(
         cfg.network.aggregation_enabled,
     ));
 
-    info!("✓ Collector initialized");
+    info!("✓ ETW sensor initialized");
     info!("✓ Normalizer initialized");
 
     // Create Sigma detection handler
@@ -1184,8 +1388,8 @@ async fn run_edr(
         allowlist_paths: yara_allowlist_paths,
     };
 
-    // Setup EventRouter (mutable)
-    let mut router_inner = EventRouter::new();
+    // Setup shared SensorEventRouter (mutable)
+    let mut router_inner = SensorEventRouter::new();
     router_inner.register_handler(Box::new(sigma_handler));
     router_inner.register_handler(Box::new(yara_handler));
 
@@ -1196,7 +1400,7 @@ async fn run_edr(
     info!("✓ Event handlers registered");
 
     // Setup graceful shutdown handler
-    let shutdown_handler = spawn_shutdown_handler(shutdown_mode, Arc::clone(&collector));
+    let shutdown_handler = spawn_shutdown_handler(shutdown_mode, Arc::clone(&sensor));
 
     info!("✓ Signal handlers configured");
     info!("");
@@ -1204,135 +1408,47 @@ async fn run_edr(
     info!("Press Ctrl+C to stop gracefully");
     info!("");
 
-    // Start ETW trace session
+    // Start shared sensor event pipeline
+    let (sensor_tx, mut sensor_rx) = mpsc::channel::<SensorEvent>(8192);
     let router_clone = Arc::clone(&router);
-    let collector_clone = Arc::clone(&collector);
+    let sensor_worker_handle = tokio::task::spawn_blocking(move || {
+        info!(target: "sensor", "Sensor event worker thread started");
+        while let Some(event) = sensor_rx.blocking_recv() {
+            router_clone.route_event(&event);
+        }
+        info!(target: "sensor", "Sensor event worker thread shutting down");
+    });
 
-    // We make trace_handle mutable so we can await it
+    let sensor_clone = Arc::clone(&sensor);
+
+    // We make trace_handle mutable so we can await it.
     let mut trace_handle = tokio::task::spawn_blocking(move || {
-        let result = collector_clone.start(move |record| {
-            // Debug: Log that callback was invoked
-            tracing::trace!(
-                "Callback invoked - Provider: {:?}, Event ID: {}, OpCode: {}",
-                record.provider_id(),
-                record.event_id(),
-                record.opcode()
-            );
-
-            // Route event to handlers (lock-free!)
-            router_clone.route_event(record);
-        });
-
-        if let Err(e) = result {
-            error!("ETW trace session error: {}", e);
+        if let Err(e) = sensor_clone.start(sensor_tx) {
+            error!("ETW sensor error: {}", e);
         }
     });
 
-    // Wait for either shutdown signal or trace completion
-    // We use a pattern that ensures we wait for the trace to finish
+    // Wait for either shutdown signal or trace completion.
     tokio::select! {
         _ = shutdown_handler => {
             info!("Shutdown signal received, waiting for ETW session to close...");
-
-            // Wait for the trace thread to finish cleanly
-            // collector.shutdown() has already been called by the signal handler
             match trace_handle.await {
-                Ok(_) => info!("ETW trace thread finished"),
-                Err(e) => error!("Failed to join trace thread: {}", e),
-            }
-
-            // Shutdown YARA worker: Drop the router (which holds tx sender)
-            // This causes rx.recv() to return None, breaking the worker loop
-            drop(router);
-            drop(response_engine);
-            info!("Signaling YARA worker to shut down...");
-
-            match yara_worker_handle.await {
-                Ok(_) => info!("YARA worker thread finished"),
-                Err(e) => error!("Failed to join YARA worker thread: {}", e),
-            }
-
-            if let Some(handle) = ioc_hash_worker_handle.take() {
-                info!("Signaling IOC hash worker to shut down...");
-                match handle.await {
-                    Ok(_) => info!("IOC hash worker thread finished"),
-                    Err(e) => error!("Failed to join IOC hash worker thread: {}", e),
-                }
-            }
-
-            if let Some(handle) = reload_poller_handle.take() {
-                info!("Signaling hot-reload poller to shut down...");
-                handle.abort();
-                let _ = handle.await;
-                info!("Hot-reload poller thread finished");
-            }
-            drop(reload_tx.take());
-            if let Some(handle) = reload_worker_handle.take() {
-                info!("Signaling hot-reload worker to shut down...");
-                match handle.await {
-                    Ok(_) => info!("Hot-reload worker thread finished"),
-                    Err(e) => error!("Failed to join hot-reload worker thread: {}", e),
-                }
-            }
-
-            info!("Signaling response worker to shut down...");
-            match response_worker_handle.await {
-                Ok(_) => info!("Response worker thread finished"),
-                Err(e) => error!("Failed to join response worker thread: {}", e),
+                Ok(_) => info!("ETW sensor thread finished"),
+                Err(e) => error!("Failed to join ETW sensor thread: {}", e),
             }
         }
-        // CRITICAL: If trace finishes unexpectedly, the collector died!
+        // CRITICAL: If trace finishes unexpectedly, the ETW sensor died.
         // This means the agent is "blind" - still running but not collecting events.
         result = &mut trace_handle => {
-            // Check if this was a graceful shutdown before treating it as an error
-            if collector.is_shutdown() {
-                info!("ETW trace thread finished after shutdown request");
-
-                // Shutdown YARA worker even in this path
-                drop(router);
-                drop(response_engine);
-                info!("Signaling YARA worker to shut down...");
-                match yara_worker_handle.await {
-                    Ok(_) => info!("YARA worker thread finished"),
-                    Err(e) => error!("Failed to join YARA worker thread: {}", e),
-                }
-
-                if let Some(handle) = ioc_hash_worker_handle.take() {
-                    info!("Signaling IOC hash worker to shut down...");
-                    match handle.await {
-                        Ok(_) => info!("IOC hash worker thread finished"),
-                        Err(e) => error!("Failed to join IOC hash worker thread: {}", e),
-                    }
-                }
-
-                if let Some(handle) = reload_poller_handle.take() {
-                    info!("Signaling hot-reload poller to shut down...");
-                    handle.abort();
-                    let _ = handle.await;
-                    info!("Hot-reload poller thread finished");
-                }
-                drop(reload_tx.take());
-                if let Some(handle) = reload_worker_handle.take() {
-                    info!("Signaling hot-reload worker to shut down...");
-                    match handle.await {
-                        Ok(_) => info!("Hot-reload worker thread finished"),
-                        Err(e) => error!("Failed to join hot-reload worker thread: {}", e),
-                    }
-                }
-
-                info!("Signaling response worker to shut down...");
-                match response_worker_handle.await {
-                    Ok(_) => info!("Response worker thread finished"),
-                    Err(e) => error!("Failed to join response worker thread: {}", e),
-                }
+            if sensor.is_shutdown() {
+                info!("ETW sensor thread finished after shutdown request");
             } else {
-                error!("🚨 CRITICAL: ETW Collector thread died unexpectedly!");
+                error!("🚨 CRITICAL: ETW sensor thread died unexpectedly!");
                 match result {
                     Ok(_) => {
-                        // Thread completed without panic, but shouldn't have finished on its own
                         error!("Trace stopped without panic (unexpected normal termination)");
                         error!("This indicates the ETW session closed unexpectedly");
-                    },
+                    }
                     Err(join_err) => {
                         if join_err.is_panic() {
                             error!("🔥 PANIC: Trace thread PANICKED!");
@@ -1348,7 +1464,7 @@ async fn run_edr(
                         } else {
                             error!("Trace thread cancelled/failed: {}", join_err);
                         }
-                    },
+                    }
                 }
                 // Force exit so Service Manager/Watchdog restarts the agent
                 // Without this, the agent appears "Online" but is blind to events
@@ -1358,11 +1474,365 @@ async fn run_edr(
         }
     }
 
+    // Common teardown (not reached if exit(1) above)
+    match sensor_worker_handle.await {
+        Ok(_) => info!("Sensor event worker thread finished"),
+        Err(e) => error!("Failed to join sensor event worker thread: {}", e),
+    }
+
+    drop(router);
+    drop(response_engine);
+    info!("Signaling YARA worker to shut down...");
+
+    match yara_worker_handle.await {
+        Ok(_) => info!("YARA worker thread finished"),
+        Err(e) => error!("Failed to join YARA worker thread: {}", e),
+    }
+
+    if let Some(handle) = ioc_hash_worker_handle.take() {
+        info!("Signaling IOC hash worker to shut down...");
+        match handle.await {
+            Ok(_) => info!("IOC hash worker thread finished"),
+            Err(e) => error!("Failed to join IOC hash worker thread: {}", e),
+        }
+    }
+
+    if let Some(handle) = reload_poller_handle.take() {
+        info!("Signaling hot-reload poller to shut down...");
+        handle.abort();
+        let _ = handle.await;
+        info!("Hot-reload poller thread finished");
+    }
+    drop(reload_tx.take());
+    if let Some(handle) = reload_worker_handle.take() {
+        info!("Signaling hot-reload worker to shut down...");
+        match handle.await {
+            Ok(_) => info!("Hot-reload worker thread finished"),
+            Err(e) => error!("Failed to join hot-reload worker thread: {}", e),
+        }
+    }
+
+    info!("Signaling response worker to shut down...");
+    match response_worker_handle.await {
+        Ok(_) => info!("Response worker thread finished"),
+        Err(e) => error!("Failed to join response worker thread: {}", e),
+    }
+
     info!("");
     info!("╔═══════════════════════════════════════════════════╗");
     info!("║           Shutdown Complete                       ║");
     info!("║        Thank you for using Rustinel!              ║");
     info!("╚═══════════════════════════════════════════════════╝");
 
+    Ok(())
+}
+
+// ── Linux eBPF EDR entry point ────────────────────────────────────────────────
+
+/// Linux eBPF EDR main loop. Mirrors `run_edr` but replaces ETW with the
+/// eBPF sensor and omits Windows-only subsystems.
+#[cfg(target_os = "linux")]
+async fn run_linux_edr() -> anyhow::Result<()> {
+    // 1. Configuration
+    let cfg = match config::AppConfig::new() {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!("Failed to load configuration: {}", err);
+            return Err(anyhow::anyhow!("configuration error: {}", err));
+        }
+    };
+
+    // 2. Logging
+    let (app_guard, alert_guard, alert_sink) = init_logging(&cfg);
+    let _guards = (app_guard, alert_guard);
+
+    log_startup_banner("Linux eBPF");
+
+    // 3. Shared state
+    let process_cache = Arc::new(ProcessCache::new());
+    let sid_cache = Arc::new(SidCache::new()); // no-op on Linux; kept for Normalizer compat
+    let dns_cache = Arc::new(DnsCache::new());
+    let connection_aggregator = Arc::new(ConnectionAggregator::with_limits(
+        cfg.network.aggregation_max_entries,
+        cfg.network.aggregation_interval_buffer_size,
+    ));
+
+    // 4. Active response engine
+    let (response_engine, response_worker_handle) = ResponseEngine::new(&cfg.response);
+
+    // 5. Sigma engine
+    let mut sigma_engine = Engine::new_for_platform_with_logging_level_and_match_debug(
+        Platform::Linux,
+        &cfg.logging.level,
+        cfg.alerts.match_debug,
+    );
+
+    if cfg.scanner.sigma_enabled {
+        info!(rules_path = ?cfg.scanner.sigma_rules_path, "Loading Sigma rules");
+        if let Err(e) = sigma_engine.load_rules(&cfg.scanner.sigma_rules_path) {
+            warn!(error = %e, "Failed to load Sigma rules");
+        } else {
+            let stats = sigma_engine.stats();
+            info!(
+                total_rules = stats.total_rules,
+                skipped_deferred_rules = stats.skipped_deferred_rules,
+                skipped_unknown_logsource_rules = stats.skipped_unknown_logsource_rules,
+                skipped_product_rules = stats.skipped_product_rules,
+                inactive_collector_rules = stats.inactive_collector_rules,
+                "Sigma engine initialized"
+            );
+            for (logsource, count) in stats.rules_by_logsource {
+                info!(logsource = %logsource, count, "Sigma rules loaded");
+            }
+        }
+    }
+    let sigma_engine = Arc::new(sigma_engine);
+
+    // 6. YARA scanner
+    let yara_scanner = if cfg.scanner.yara_enabled {
+        match scanner::Scanner::new(&cfg.scanner.yara_rules_path) {
+            Ok(s) => {
+                info!("YARA scanner initialized");
+                Arc::new(s)
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to load YARA rules; YARA scanning disabled");
+                Arc::new(scanner::Scanner::new(Path::new(".")).expect("empty YARA scanner"))
+            }
+        }
+    } else {
+        Arc::new(scanner::Scanner::new(Path::new(".")).expect("empty YARA scanner"))
+    };
+
+    let yara_allowlist_paths =
+        scanner::normalize_allowlist_paths(&cfg.scanner.yara_allowlist_paths);
+
+    // 7. IOC engine
+    let ioc_engine = Arc::new(IocEngine::load(&cfg.ioc));
+
+    // 8. Detector store + hot-reload
+    let detectors = DetectorStore::new(
+        Arc::clone(&sigma_engine),
+        Arc::clone(&yara_scanner),
+        Arc::clone(&ioc_engine),
+    );
+
+    let mut reload_poller_handle = None;
+    let mut reload_worker_handle = None;
+    let mut reload_tx = None;
+    if cfg.reload.enabled {
+        let (tx, rx) = mpsc::unbounded_channel();
+        reload_worker_handle = Some(reload::spawn_reload_worker(
+            Arc::clone(&detectors),
+            cfg.scanner.clone(),
+            cfg.ioc.clone(),
+            cfg.reload.clone(),
+            cfg.logging.level.clone(),
+            cfg.alerts.match_debug,
+            rx,
+        ));
+        reload_poller_handle = Some(reload::spawn_reload_poller(
+            cfg.scanner.clone(),
+            cfg.ioc.clone(),
+            cfg.reload.clone(),
+            tx.clone(),
+        ));
+        reload_tx = Some(tx);
+    }
+
+    // 9. YARA background worker
+    let (yara_tx, mut yara_rx) = mpsc::channel::<(String, u32)>(1000);
+    let detectors_for_yara = Arc::clone(&detectors);
+    let yara_allowlist_paths_for_worker = yara_allowlist_paths.clone();
+    let alert_sink_for_yara = alert_sink.clone();
+    let response_engine_for_yara = response_engine.clone();
+    let match_debug = cfg.alerts.match_debug;
+    let yara_worker_handle = tokio::task::spawn_blocking(move || {
+        let mut scan_error_limiter =
+            LogRateLimiter::new(Duration::from_secs(WORKER_DEBUG_LOG_WINDOW_SECS));
+        while let Some((path, pid)) = yara_rx.blocking_recv() {
+            if scanner::is_path_allowlisted(&path, &yara_allowlist_paths_for_worker) {
+                continue;
+            }
+            let scanner = detectors_for_yara.yara();
+            match scanner.scan_file(&path, match_debug) {
+                Ok(matches) if !matches.is_empty() => {
+                    for rule_match in &matches {
+                        let details = build_yara_match_details(match_debug, rule_match);
+                        let alert = build_yara_alert(
+                            &rule_match.rule,
+                            &path,
+                            pid,
+                            details,
+                            Platform::Linux,
+                            "ebpf",
+                        );
+                        alert_sink_for_yara.write_alert(&alert);
+                        response_engine_for_yara.handle_alert(&alert);
+                    }
+                }
+                Err(e) => {
+                    let decision = scan_error_limiter.should_emit("scan_error");
+                    if decision.should_emit {
+                        debug!(
+                            pid,
+                            file = %path,
+                            error = %e,
+                            suppressed = decision.suppressed_since_last_emit,
+                            "YARA scan failure"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    // 10. IOC hash background worker
+    let (ioc_hash_tx, mut ioc_hash_worker_handle) = if ioc_engine.is_enabled() {
+        let (hash_tx, mut hash_rx) = mpsc::channel::<(String, u32)>(1000);
+        let detectors_for_ioc = Arc::clone(&detectors);
+        let alert_sink_for_ioc = alert_sink.clone();
+        let response_engine_for_ioc = response_engine.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            let mut cache = HashCache::new();
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut last_requirements = HashRequirements {
+                md5: false,
+                sha1: false,
+                sha256: false,
+            };
+            let mut hash_error_limiter =
+                LogRateLimiter::new(Duration::from_secs(WORKER_DEBUG_LOG_WINDOW_SECS));
+            while let Some((path, pid)) = hash_rx.blocking_recv() {
+                if path.is_empty() {
+                    continue;
+                }
+                let ioc = detectors_for_ioc.ioc();
+                if !ioc.is_enabled() || !ioc.wants_hashing() {
+                    continue;
+                }
+                let requirements = ioc.hash_requirements();
+                if requirements != last_requirements {
+                    cache = HashCache::new();
+                    last_requirements = requirements;
+                }
+                let max_size = ioc.max_file_size_bytes();
+                if ioc.is_hash_allowlisted(&path) {
+                    continue;
+                }
+                if max_size > 0 {
+                    if let Ok(meta) = std::fs::metadata(&path) {
+                        if meta.len() > max_size {
+                            continue;
+                        }
+                    }
+                }
+                match cache.get_or_compute(Path::new(&path), requirements, &mut buf) {
+                    Ok(hashes) => {
+                        for m in ioc.match_hashes(&hashes) {
+                            let alert = ioc.build_alert_for_hash_match(
+                                &m,
+                                &path,
+                                pid,
+                                Platform::Linux,
+                                "ebpf",
+                            );
+                            alert_sink_for_ioc.write_alert(&alert);
+                            response_engine_for_ioc.handle_alert(&alert);
+                        }
+                    }
+                    Err(e) => {
+                        let decision = hash_error_limiter.should_emit("hash_error");
+                        if decision.should_emit {
+                            debug!(
+                                pid,
+                                file = %path,
+                                error = %e,
+                                suppressed = decision.suppressed_since_last_emit,
+                                "IOC hash failure"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+        (Some(hash_tx), Some(handle))
+    } else {
+        (None, None)
+    };
+
+    // 11. Normalizer
+    let normalizer = Arc::new(Normalizer::new(
+        Arc::clone(&process_cache),
+        Arc::clone(&sid_cache),
+        Arc::clone(&dns_cache),
+        Arc::clone(&connection_aggregator),
+        cfg.network.aggregation_enabled,
+    ));
+
+    // 12. Detection handlers + router
+    let sigma_handler = SigmaDetectionHandler {
+        normalizer: Arc::clone(&normalizer),
+        detectors: Arc::clone(&detectors),
+        ioc_hash_tx,
+        alert_sink: alert_sink.clone(),
+        response_engine: response_engine.clone(),
+    };
+    let yara_handler = YaraEventHandler {
+        tx: yara_tx,
+        allowlist_paths: yara_allowlist_paths,
+    };
+    let mut router_inner = SensorEventRouter::new();
+    router_inner.register_handler(Box::new(sigma_handler));
+    router_inner.register_handler(Box::new(yara_handler));
+    let router = Arc::new(router_inner);
+
+    // 13. eBPF sensor
+    let sensor = Arc::new(EbpfSensor::new());
+
+    info!("Starting eBPF sensor...");
+    info!("Press Ctrl+C to stop gracefully");
+
+    let (sensor_tx, mut sensor_rx) = mpsc::channel::<SensorEvent>(8192);
+    let router_for_worker = Arc::clone(&router);
+    let sensor_worker_handle = tokio::task::spawn_blocking(move || {
+        while let Some(event) = sensor_rx.blocking_recv() {
+            router_for_worker.route_event(&event);
+        }
+    });
+
+    let sensor_clone = Arc::clone(&sensor);
+    if let Err(e) = sensor_clone.start(sensor_tx) {
+        error!("eBPF sensor failed to start: {:#}", e);
+        return Err(e);
+    }
+
+    // 14. Wait for Ctrl+C
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => info!("Received Ctrl+C, shutting down"),
+        Err(e) => error!("Failed to listen for Ctrl+C: {}", e),
+    }
+    sensor.shutdown();
+
+    // Drain workers
+    drop(router);
+    drop(response_engine);
+    let _ = sensor_worker_handle.await;
+    let _ = yara_worker_handle.await;
+    if let Some(h) = ioc_hash_worker_handle.take() {
+        let _ = h.await;
+    }
+    if let Some(h) = reload_poller_handle.take() {
+        h.abort();
+        let _ = h.await;
+    }
+    drop(reload_tx.take());
+    if let Some(h) = reload_worker_handle.take() {
+        let _ = h.await;
+    }
+    let _ = response_worker_handle.await;
+
+    info!("Shutdown complete");
     Ok(())
 }

@@ -17,7 +17,7 @@ site_name = "Rustinel"
 # meaningful description of the site content for use by search engines.
 #
 # Read more: https://zensical.org/docs/setup/basics/#site_description
-site_description = "High-performance, memory-safe Windows endpoint detection agent with ETW-based telemetry and Sigma rule engine"
+site_description = "Open-source endpoint detection and response for Windows ETW and Linux eBPF, built in Rust"
 
 # The site_author attribute. This is used in the HTML head element.
 #
@@ -50,6 +50,7 @@ Copyright &copy; 2026 The Rustinel Authors
 nav = [
     { "Home" = "index.md" },
     { "Getting Started" = "getting-started.md" },
+    { "Operations" = "operations.md" },
     { "Configuration" = "configuration.md" },
     { "CLI" = "cli.md" },
     { "Architecture" = "architecture.md" },
@@ -313,5 +314,4 @@ toggle.name = "Switch to light mode"
 [[project.extra.social]]
 icon = "fontawesome/brands/github"
 link = "https://github.com/Karib0u/rustinel"
-
 

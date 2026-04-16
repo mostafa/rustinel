@@ -1,5 +1,6 @@
 # Rust build artifacts
 /target/
+ebpf/target/
 **/*.rs.bk
 
 # IDE / Editor files
@@ -29,6 +30,8 @@ AGENTS.md
 # Logs
 *.log
 logs/
+ebpf/rustinel-ebpf.o
+ebpf/Cargo.lock
 
 tests/**/*
 !tests/integration.rs
@@ -36,7 +39,5 @@ tests/**/*
 *.exe
 *.pdb
 
-rules/sigma/**/*.yml
-rules/sigma/**/*.yaml
-rules/**/*.md
-rules/yara/**/*.yar
+.codex
+*.zip

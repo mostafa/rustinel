@@ -12,12 +12,12 @@
 use crate::models::{
     Alert, AlertSeverity, EventCategory, EventFields, MatchDetails, ProcessContext,
 };
+use crate::sensor::Platform;
 use serde::Serialize;
 use std::net::IpAddr;
 
 const ECS_VERSION: &str = "9.3.0";
 const EVENT_MODULE: &str = "edr";
-const EVENT_PROVIDER: &str = "edr-rust";
 
 #[derive(Serialize)]
 pub struct DnsAnswer {
@@ -71,6 +71,14 @@ pub struct EcsAlert {
     /// Source that generated the event
     #[serde(rename = "event.provider")]
     pub event_provider: String,
+
+    /// Host OS type for the sensor that produced the event.
+    #[serde(rename = "host.os.type")]
+    pub host_os_type: String,
+
+    /// Host OS family for the sensor that produced the event.
+    #[serde(rename = "host.os.family")]
+    pub host_os_family: String,
 
     /// Detection rule name
     #[serde(rename = "rule.name")]
@@ -465,8 +473,9 @@ fn ecs_event_type(category: EventCategory, opcode: u8, event_id: u16) -> Vec<Str
         },
         EventCategory::Network => vec!["connection".to_string()],
         EventCategory::File => match opcode {
-            64 | 65 => vec!["creation".to_string()],
+            64 => vec!["creation".to_string()],
             70 | 72 => vec!["deletion".to_string()],
+            71 => vec!["change".to_string()],
             _ => vec!["change".to_string()],
         },
         EventCategory::Registry => match opcode {
@@ -505,8 +514,9 @@ fn ecs_event_action(category: EventCategory, opcode: u8, event_id: u16) -> Optio
         },
         EventCategory::Network => "network-connection",
         EventCategory::File => match opcode {
-            64 | 65 => "file-create",
+            64 => "file-create",
             70 | 72 => "file-delete",
+            71 => "file-rename",
             _ => "file-change",
         },
         EventCategory::Registry => match opcode {
@@ -553,8 +563,22 @@ fn event_dataset(category: EventCategory) -> String {
     format!("{}.{}", EVENT_MODULE, suffix)
 }
 
-fn event_provider() -> String {
-    EVENT_PROVIDER.to_string()
+fn event_provider(alert: &Alert) -> String {
+    alert.event.provider.clone()
+}
+
+fn host_os_type(platform: Platform) -> String {
+    match platform {
+        Platform::Windows => "windows".to_string(),
+        Platform::Linux => "linux".to_string(),
+    }
+}
+
+fn host_os_family(platform: Platform) -> String {
+    match platform {
+        Platform::Windows => "windows".to_string(),
+        Platform::Linux => "linux".to_string(),
+    }
 }
 
 fn network_direction_from_category(category: EventCategory) -> Option<String> {
@@ -723,7 +747,9 @@ impl From<&Alert> for EcsAlert {
             event_severity: Some(alert_severity_to_event_severity(alert.severity)),
             event_module: EVENT_MODULE.to_string(),
             event_dataset: event_dataset(alert.event.category),
-            event_provider: event_provider(),
+            event_provider: event_provider(alert),
+            host_os_type: host_os_type(alert.event.platform),
+            host_os_family: host_os_family(alert.event.platform),
             rule_name: alert.rule_name.clone(),
             rule_description: alert.rule_description.clone(),
             edr_rule_severity: format!("{:?}", alert.severity),
@@ -830,7 +856,10 @@ impl From<&Alert> for EcsAlert {
                 ecs.source_ip = f.source_ip.clone();
                 ecs.source_port = parse_u16(&f.source_port);
                 ecs.destination_domain = f.destination_hostname.clone();
-                ecs.network_transport = network_transport_from_opcode(opcode);
+                ecs.network_transport = f
+                    .protocol
+                    .clone()
+                    .or_else(|| network_transport_from_opcode(opcode));
                 if let Some(ip) = ecs.source_ip.as_deref().or(ecs.destination_ip.as_deref()) {
                     ecs.network_type = network_type_from_ip(ip);
                 }
@@ -1067,6 +1096,7 @@ mod tests {
         MatchDetails, NormalizedEvent, ProcessContext, ProcessCreationFields, RegistryEventFields,
         ServiceCreationFields,
     };
+    use crate::sensor::Platform;
     use std::collections::HashMap;
 
     #[test]
@@ -1078,6 +1108,8 @@ mod tests {
             engine: DetectionEngine::Sigma,
             event: NormalizedEvent {
                 timestamp: "2026-01-06T00:00:00Z".to_string(),
+                platform: Platform::Windows,
+                provider: "etw".to_string(),
                 category: EventCategory::Process,
                 event_id: 1,
                 event_id_string: "1".to_string(),
@@ -1109,7 +1141,9 @@ mod tests {
         assert_eq!(ecs.event_kind, "alert");
         assert_eq!(ecs.event_module, EVENT_MODULE);
         assert_eq!(ecs.event_dataset, "edr.process");
-        assert_eq!(ecs.event_provider, EVENT_PROVIDER);
+        assert_eq!(ecs.event_provider, "etw");
+        assert_eq!(ecs.host_os_type, "windows");
+        assert_eq!(ecs.host_os_family, "windows");
         assert_eq!(ecs.event_category, vec!["process".to_string()]);
         assert_eq!(ecs.event_type, vec!["start".to_string()]);
         assert_eq!(ecs.event_action.as_deref(), Some("process-start"));
@@ -1136,6 +1170,8 @@ mod tests {
             engine: DetectionEngine::Sigma,
             event: NormalizedEvent {
                 timestamp: "2026-01-06T00:00:00Z".to_string(),
+                platform: Platform::Windows,
+                provider: "etw".to_string(),
                 category: EventCategory::Service,
                 event_id: 7045,
                 event_id_string: "7045".to_string(),
@@ -1176,6 +1212,8 @@ mod tests {
             engine: DetectionEngine::Sigma,
             event: NormalizedEvent {
                 timestamp: "2026-01-06T00:00:00Z".to_string(),
+                platform: Platform::Windows,
+                provider: "etw".to_string(),
                 category: EventCategory::Service,
                 event_id: 7045,
                 event_id_string: "7045".to_string(),
@@ -1238,6 +1276,8 @@ mod tests {
             engine: DetectionEngine::Sigma,
             event: NormalizedEvent {
                 timestamp: "2026-01-06T00:00:00Z".to_string(),
+                platform: Platform::Windows,
+                provider: "etw".to_string(),
                 category: EventCategory::Registry,
                 event_id: 13,
                 event_id_string: "13".to_string(),
@@ -1276,6 +1316,8 @@ mod tests {
             engine: DetectionEngine::Sigma,
             event: NormalizedEvent {
                 timestamp: "2026-01-06T00:00:00Z".to_string(),
+                platform: Platform::Linux,
+                provider: "ebpf".to_string(),
                 category: EventCategory::Dns,
                 event_id: 22,
                 event_id_string: "22".to_string(),
@@ -1283,6 +1325,7 @@ mod tests {
                 fields: EventFields::DnsQuery(DnsQueryFields {
                     query_name: Some("example.com".to_string()),
                     query_results: Some("1.1.1.1".to_string()),
+                    record_type: Some("A".to_string()),
                     query_status: Some("NOERROR".to_string()),
                     process_id: None,
                     image: None,
@@ -1297,6 +1340,9 @@ mod tests {
         assert_eq!(ecs.event_type, vec!["protocol".to_string()]);
         assert_eq!(ecs.network_protocol, Some("dns".to_string()));
         assert_eq!(ecs.network_direction, Some("egress".to_string()));
+        assert_eq!(ecs.event_provider, "ebpf");
+        assert_eq!(ecs.host_os_type, "linux");
+        assert_eq!(ecs.host_os_family, "linux");
         assert_eq!(ecs.dns_query, Some("example.com".to_string()));
         let answers = ecs.dns_answers.expect("dns.answers should be set");
         assert_eq!(answers.len(), 1);
@@ -1315,11 +1361,14 @@ mod tests {
             engine: DetectionEngine::Sigma,
             event: NormalizedEvent {
                 timestamp: "2026-01-06T00:00:00Z".to_string(),
+                platform: Platform::Windows,
+                provider: "etw".to_string(),
                 category: EventCategory::File,
                 event_id: 11,
                 event_id_string: "11".to_string(),
                 opcode: 64,
                 fields: EventFields::FileEvent(FileEventFields {
+                    source_filename: None,
                     target_filename: Some(r"C:\Users\alice\evil.ps1".to_string()),
                     process_id: Some("777".to_string()),
                     image: Some(r"C:\Windows\System32\cmd.exe".to_string()),
@@ -1348,6 +1397,8 @@ mod tests {
             engine: DetectionEngine::Sigma,
             event: NormalizedEvent {
                 timestamp: "2026-02-04T00:00:00Z".to_string(),
+                platform: Platform::Windows,
+                provider: "etw".to_string(),
                 category: EventCategory::Process,
                 event_id: 1,
                 event_id_string: "1".to_string(),

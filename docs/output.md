@@ -1,176 +1,142 @@
 # Output Format
 
-Rustinel produces two types of output: operational logs and security alerts.
+Rustinel emits two outputs:
+
+- Operational logs for runtime state and troubleshooting
+- ECS NDJSON alerts for detections
 
 ## Operational Logs
 
-**Location:** `logs/rustinel.log.YYYY-MM-DD`
+Location:
 
-**Format:** Plain text with timestamps
+- Default: `logs/rustinel.log.<date>`
 
-**Rotation:** Daily
+Content includes:
 
-**Content:**
-- Startup/shutdown messages
-- Detection triggers
-- Errors and warnings
-- Debug information (if enabled)
-- Active response actions (dry-run or termination)
+- Startup and shutdown lifecycle
+- Sensor initialization
+- Rule and IOC reload activity
+- Detection hits
+- Active response actions
+- Warnings and errors
 
-**Example:**
+Example:
 
-```
-2025-01-15T14:32:10Z INFO  rustinel: Starting Rustinel EDR agent
-2025-01-15T14:32:10Z INFO  collector: Registered 9 ETW providers
-2025-01-15T14:32:10Z INFO  engine: Loaded 42 Sigma rules
-2025-01-15T14:32:15Z INFO  engine: Detection: Whoami Execution
-2025-01-15T14:32:16Z INFO  response: Active response would terminate process pid=4242 image="C:\\Temp\\evil.exe" dry_run=true
+Field rendering varies by logger, but the message text is representative:
+
+```text
+9:00 PM INFO  rustinel: Rustinel v1.0.0 (Linux eBPF)
+9:00 PM INFO  rustinel: Loading Sigma rules
+9:00:01 PM INFO  rustinel: YARA scanner initialized
+9:00:05 PM INFO  engine: Sigma detection triggered
+9:00:05 PM INFO  response: Active response would terminate process pid=4242 image="/usr/bin/whoami" dry_run=true
 ```
 
 ## Security Alerts
 
-**Location:** `logs/alerts.json.YYYY-MM-DD`
+Location:
 
-**Format:** ECS NDJSON (one JSON object per line)
+- Default: `logs/alerts.json.<date>`
 
-**Rotation:** Daily
+Format:
 
-**ECS version:** `9.3.0` (emitted as `ecs.version`)
+- One ECS JSON document per line
+- ECS version `9.3.0`
 
-### Alert Structure
+### Important Fields
+
+| Field | Meaning |
+| --- | --- |
+| `@timestamp` | Event time in UTC |
+| `ecs.version` | Always `9.3.0` |
+| `event.kind` | Always `alert` |
+| `event.category` | ECS category array |
+| `event.type` | ECS type array |
+| `event.action` | Normalized action keyword |
+| `event.code` | Sysmon-style or native event ID string |
+| `event.module` | Always `edr` |
+| `event.dataset` | `edr.<category>` |
+| `event.provider` | `etw` on Windows, `ebpf` on Linux |
+| `rule.name` | Detection rule title |
+| `edr.rule.severity` | Low, Medium, High, or Critical |
+| `edr.rule.engine` | `Sigma`, `Yara`, or `Ioc` |
+
+### Linux Process Alert Example
 
 ```json
 {
-  "@timestamp": "2025-01-15T14:32:10Z",
+  "@timestamp": "<date>T21:00:05Z",
   "ecs.version": "9.3.0",
   "event.kind": "alert",
   "event.category": ["process"],
   "event.type": ["start"],
   "event.action": "process-start",
   "event.code": "1",
-  "event.severity": 75,
   "event.module": "edr",
   "event.dataset": "edr.process",
-  "event.provider": "edr-rust",
-  "rule.name": "Whoami Execution",
+  "event.provider": "ebpf",
+  "rule.name": "Example - Whoami Execution (Linux)",
   "edr.rule.severity": "Low",
   "edr.rule.engine": "Sigma",
-  "process.executable": "C:\\Windows\\System32\\whoami.exe",
-  "process.name": "whoami.exe",
-  "process.command_line": "whoami /all",
-  "process.pid": 1234,
-  "process.parent.executable": "C:\\Windows\\System32\\cmd.exe",
-  "process.parent.pid": 5678,
-  "user.name": "username",
-  "user.domain": "DOMAIN",
-  "related.user": ["username"]
+  "host.os.type": "linux",
+  "host.os.family": "linux",
+  "process.executable": "/usr/bin/whoami",
+  "process.name": "whoami",
+  "user.name": "root"
 }
 ```
 
-### Core ECS Fields
+### Windows Process Alert Example
 
-- `@timestamp` - Event time (ISO 8601 UTC)
-- `ecs.version` - ECS version, always `9.3.0`
-- `event.kind` - Always `alert`
-- `event.category` - ECS category array (see table below)
-- `event.type` - ECS type array (see table below)
-- `event.action` - Action keyword (for example `process-start`)
-- `event.code` - Source event ID (Sysmon or Windows ID)
-- `event.severity` - Numeric severity (Low=25, Medium=50, High=75, Critical=100)
-- `event.module` - Always `edr`
-- `event.dataset` - `edr.<category>` (for example `edr.process`)
-- `event.provider` - Always `edr-rust`
-- `rule.name` - Detection rule name
+```json
+{
+  "@timestamp": "<date>T21:00:05Z",
+  "ecs.version": "9.3.0",
+  "event.kind": "alert",
+  "event.category": ["process"],
+  "event.type": ["start"],
+  "event.action": "process-start",
+  "event.code": "1",
+  "event.module": "edr",
+  "event.dataset": "edr.process",
+  "event.provider": "etw",
+  "rule.name": "Example - Whoami Execution (CommandLine + Image)",
+  "edr.rule.severity": "Low",
+  "edr.rule.engine": "Sigma",
+  "host.os.type": "windows",
+  "host.os.family": "windows",
+  "process.executable": "C:\\Windows\\System32\\whoami.exe",
+  "process.command_line": "whoami /all"
+}
+```
 
-### Event Categorization (ECS 9.3.0)
+## Event Families
 
-| Internal Category | event.category | event.type (typical) | event.dataset |
-| --- | --- | --- | --- |
-| Process | process | start, end, info | edr.process |
-| Network | network | connection | edr.network |
-| File | file | creation, deletion, change | edr.file |
-| Registry | registry | creation, deletion, change | edr.registry |
-| DNS | network | protocol | edr.dns |
-| ImageLoad | library | start | edr.library |
-| Scripting | process | info | edr.scripting |
-| WMI | api | info | edr.wmi |
-| Service | configuration | creation, change | edr.service |
-| Task | configuration | creation, change | edr.task |
+| Internal category | ECS dataset |
+| --- | --- |
+| Process | `edr.process` |
+| Network | `edr.network` |
+| File | `edr.file` |
+| Registry | `edr.registry` |
+| DNS | `edr.dns` |
+| Image load | `edr.library` |
+| Scripting | `edr.scripting` |
+| WMI | `edr.wmi` |
+| Service | `edr.service` |
+| Task | `edr.task` |
 
-### Process Context
+The full field set depends on event type and platform. Windows alerts can include PE metadata, registry details, PowerShell content, and service or task context. Linux alerts currently focus on process, network, file, and DNS fields.
 
-- `process.executable`, `process.name`, `process.command_line`, `process.pid`
-- `process.parent.executable`, `process.parent.name`, `process.parent.command_line`, `process.parent.pid`
-- `process.working_directory`
-- `process.pe.original_file_name`, `process.pe.product`, `process.pe.description`
-- `edr.process.integrity_level`
-- `winlog.logon.id`, `winlog.logon.guid`
-- `user.name`, `user.domain`, `user.id`
+## SIEM Shipping
 
-### Network Context
-
-- `source.ip`, `source.port`
-- `destination.ip`, `destination.port`, `destination.domain`
-- `network.transport` (tcp or udp)
-- `network.type` (ipv4 or ipv6)
-- `network.protocol` (dns for DNS events)
-- `network.direction` (egress for network and dns events)
-
-### File and Library Context
-
-- `file.path`, `file.name`, `file.extension`, `file.created`
-- `file.pe.original_file_name`, `file.pe.product`, `file.pe.description`
-- `file.code_signature.exists`, `file.code_signature.subject_name`
-- `dll.name`, `dll.path` (ImageLoad events)
-
-### Registry Context
-
-- `registry.path`, `registry.hive`, `registry.key`, `registry.value`
-- `registry.data.strings`
-- `edr.registry.event_type`, `edr.registry.new_name`
-
-### DNS Context
-
-- `dns.question.name`
-- `dns.answers` (array of objects with `data`)
-- `dns.resolved_ip`
-- `dns.response_code`
-
-### Service and Task Context
-
-- `service.name`
-- `edr.service.executable`, `edr.service.type`, `edr.service.start_type`, `edr.service.account_name`
-- `edr.task.name`, `edr.task.content`, `edr.task.user_name`
-
-### PowerShell, WMI, Remote Thread
-
-- `edr.powershell.script_block_text`, `edr.powershell.script_block_id`
-- `edr.wmi.operation`, `edr.wmi.query`, `edr.wmi.namespace`, `edr.wmi.event_type`
-- `edr.remote_thread.target_pid`, `edr.remote_thread.target_image`, `edr.remote_thread.start_address`, `edr.remote_thread.start_module`, `edr.remote_thread.start_function`
-- `edr.process.target_image`
-
-### Related Fields
-
-- `related.ip` - Source, destination, and DNS resolved IPs
-- `related.user` - User name and SID when available
-
-### EDR Extensions
-
-Fields not covered by ECS are emitted with the `edr.` prefix. The `edr.*` list above is authoritative for current output.
-
-## SIEM Integration
-
-Alerts are designed for direct ingestion into:
-- Elasticsearch or OpenSearch
-- Splunk
-- Any SIEM supporting ECS or NDJSON
-
-**Example Filebeat config:**
+Any log shipper that can tail NDJSON works. Example Filebeat input:
 
 ```yaml
 filebeat.inputs:
-- type: log
+- type: filestream
   paths:
-    - C:\\Rustinel\\logs\\alerts.json.*
-  json.keys_under_root: true
+    - /opt/rustinel/logs/alerts.json.*
+  parsers:
+    - ndjson:
+        target: ""
 ```

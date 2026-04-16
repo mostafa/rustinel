@@ -16,15 +16,24 @@ debounce_ms = 2000          # poll cadence is max(debounce_ms, 2000)
 # - response.allowlist_paths
 # - ioc.hash_allowlist_paths
 # - scanner.yara_allowlist_paths
-[allowlist]
-paths = [
-  "C:\\Windows\\",
-  "C:\\Program Files\\",
-  "C:\\Program Files (x86)\\"
-]
+#
+# Platform defaults are compiled in — only set this to override them.
+#
+# Linux defaults:
+#   /usr/bin/, /usr/sbin/, /usr/lib/, /usr/lib64/, /usr/libexec/,
+#   /bin/, /sbin/, /lib/, /lib64/
+# Windows defaults:
+#   C:\Windows\, C:\Program Files\, C:\Program Files (x86)\
+#
+# [allowlist]
+# paths = [
+#   "/usr/bin/",
+#   "/usr/sbin/",
+#   "/custom/trusted/path/",
+# ]
 
 # 2. Operational Logging (The Agent's internal health)
-#    Writes to: {directory}/{filename}.YYYY-MM-DD
+#    Writes to: {directory}/{filename}.<date>
 [logging]
 level = "info"              # trace, debug, info, warn, error
 # Optional target-aware filter (takes precedence over level when set)
@@ -34,7 +43,7 @@ filename = "rustinel.log"
 console_output = true       # If true, duplicate logs to stdout (dev mode)
 
 # 3. Security Alerts (The Detection Output)
-#    Writes to: {directory}/{filename}.YYYY-MM-DD
+#    Writes to: {directory}/{filename}.<date>
 [alerts]
 directory = "logs"
 filename = "alerts.json"    # Will contain newline-delimited JSON (NDJSON)
@@ -46,20 +55,13 @@ enabled = false
 prevention_enabled = false
 min_severity = "critical"   # sigma: critical only; yara always treated as critical
 channel_capacity = 128
-allowlist_images = [
-  "system",
-  "smss.exe",
-  "csrss.exe",
-  "wininit.exe",
-  "winlogon.exe",
-  "services.exe",
-  "lsass.exe",
-  "svchost.exe",
-  "explorer.exe",
-  "dwm.exe",
-  "fontdrvhost.exe",
-  "sihost.exe"
-]
+# Processes that will never be terminated, matched by image basename or full path.
+# Complement the compiled-in path allowlist above for named system processes.
+#
+# Linux examples:  systemd, systemd-journald, sshd, dbus-daemon, auditd
+# Windows examples: smss.exe, csrss.exe, wininit.exe, lsass.exe, svchost.exe
+#
+# allowlist_images = []
 
 # 5. Atomic IOC Detection (Hashes, IPs, Domains, Path Regex)
 [ioc]

@@ -323,17 +323,29 @@ fn parse_pid(value: Option<&str>) -> Option<u32> {
 }
 
 fn normalize_path(value: &str) -> String {
-    value.trim().replace('/', "\\").to_ascii_lowercase()
+    #[cfg(target_os = "linux")]
+    {
+        value.trim().to_ascii_lowercase()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        value.trim().replace('/', "\\").to_ascii_lowercase()
+    }
 }
 
 fn normalize_allowlist_paths(values: &[String]) -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    const SEP: char = '/';
+    #[cfg(not(target_os = "linux"))]
+    const SEP: char = '\\';
+
     values
         .iter()
         .filter(|v| !v.trim().is_empty())
         .map(|value| {
             let mut normalized = normalize_path(value);
-            if !normalized.ends_with('\\') {
-                normalized.push('\\');
+            if !normalized.ends_with(SEP) {
+                normalized.push(SEP);
             }
             normalized
         })
@@ -400,9 +412,20 @@ fn terminate_process(pid: u32) -> Result<(), String> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn terminate_process(pid: u32) -> Result<(), String> {
+    let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        let err = std::io::Error::last_os_error();
+        Err(format!("kill({}, SIGKILL) failed: {}", pid, err))
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn terminate_process(_pid: u32) -> Result<(), String> {
-    Err("Active response termination is only supported on Windows".to_string())
+    Err("Active response termination is not supported on this platform".to_string())
 }
 
 #[cfg(test)]
@@ -412,6 +435,7 @@ mod tests {
         Alert, AlertSeverity, DetectionEngine, EventCategory, EventFields, NormalizedEvent,
         ProcessCreationFields,
     };
+    use crate::sensor::Platform;
 
     #[test]
     fn test_parse_pid_decimal() {
@@ -436,13 +460,26 @@ mod tests {
 
     #[test]
     fn test_allowlist_path_prefix() {
-        let allowlist_paths = vec!["C:\\Windows\\".to_string()];
-        let allowlist_images = vec![];
-        assert!(is_allowlisted(
-            "C:\\Windows\\System32\\svchost.exe",
-            &normalize_allowlist_images(&allowlist_images),
-            &normalize_allowlist_paths(&allowlist_paths),
-        ));
+        #[cfg(windows)]
+        {
+            let allowlist_paths = vec!["C:\\Windows\\".to_string()];
+            let allowlist_images = vec![];
+            assert!(is_allowlisted(
+                "C:\\Windows\\System32\\svchost.exe",
+                &normalize_allowlist_images(&allowlist_images),
+                &normalize_allowlist_paths(&allowlist_paths),
+            ));
+        }
+        #[cfg(not(windows))]
+        {
+            let allowlist_paths = vec!["/usr/bin/".to_string()];
+            let allowlist_images = vec![];
+            assert!(is_allowlisted(
+                "/usr/bin/bash",
+                &normalize_allowlist_images(&allowlist_images),
+                &normalize_allowlist_paths(&allowlist_paths),
+            ));
+        }
     }
 
     #[test]
@@ -454,6 +491,8 @@ mod tests {
             engine: DetectionEngine::Sigma,
             event: NormalizedEvent {
                 timestamp: "2026-02-03T00:00:00Z".to_string(),
+                platform: Platform::Windows,
+                provider: "etw".to_string(),
                 category: EventCategory::Process,
                 event_id: 1,
                 event_id_string: "1".to_string(),

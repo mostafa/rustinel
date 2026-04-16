@@ -7,6 +7,7 @@ use crate::models::{
     Alert, AlertSeverity, DetectionEngine, EventCategory, EventFields, NormalizedEvent,
     ProcessCreationFields,
 };
+use crate::sensor::Platform;
 use digest::Digest;
 use ipnetwork::IpNetwork;
 use md5::Md5;
@@ -23,6 +24,20 @@ use tracing::{info, warn};
 
 const HASH_CACHE_MAX_ENTRIES: usize = 10_000;
 const HASH_CACHE_TTL_SECS: u64 = 6 * 60 * 60;
+
+/// Normalize a file path for allowlist prefix matching.
+/// Windows: convert to backslashes and lowercase (case-insensitive FS).
+/// Linux:   keep as-is (case-sensitive FS, native forward-slash paths).
+fn normalize_allowlist_path(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        path.trim().replace('/', "\\").to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        path.trim().to_string()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HashRequirements {
@@ -143,7 +158,7 @@ impl IocEngine {
         let hash_allowlist_paths: Vec<String> = cfg
             .hash_allowlist_paths
             .iter()
-            .map(|p| p.to_ascii_lowercase())
+            .map(|p| normalize_allowlist_path(p))
             .collect();
 
         if !hash_allowlist_paths.is_empty() {
@@ -214,10 +229,10 @@ impl IocEngine {
     }
 
     pub fn is_hash_allowlisted(&self, path: &str) -> bool {
-        let lower = path.to_ascii_lowercase();
+        let normalized = normalize_allowlist_path(path);
         self.hash_allowlist_paths
             .iter()
-            .any(|prefix| lower.starts_with(prefix))
+            .any(|prefix| normalized.starts_with(prefix.as_str()))
     }
 
     pub fn check_event(&self, event: &NormalizedEvent) -> Vec<IocMatch> {
@@ -274,7 +289,14 @@ impl IocEngine {
         }
     }
 
-    pub fn build_alert_for_hash_match(&self, m: &IocMatch, path: &str, pid: u32) -> Alert {
+    pub fn build_alert_for_hash_match(
+        &self,
+        m: &IocMatch,
+        path: &str,
+        pid: u32,
+        platform: Platform,
+        provider: &str,
+    ) -> Alert {
         Alert {
             severity: self.severity,
             rule_name: ioc_rule_name(m),
@@ -282,6 +304,8 @@ impl IocEngine {
             engine: DetectionEngine::Ioc,
             event: NormalizedEvent {
                 timestamp: crate::utils::now_timestamp_string(),
+                platform,
+                provider: provider.to_string(),
                 category: EventCategory::Process,
                 event_id: 1,
                 event_id_string: "1".to_string(),
@@ -988,6 +1012,7 @@ fn now_secs() -> u64 {
 mod tests {
     use super::*;
     use crate::models::EventFields;
+    use crate::sensor::Platform;
 
     #[test]
     fn test_domain_suffix_match() {
@@ -1014,6 +1039,8 @@ mod tests {
 
         let event = NormalizedEvent {
             timestamp: "2025-01-01T00:00:00Z".to_string(),
+            platform: Platform::Windows,
+            provider: "etw".to_string(),
             category: EventCategory::Dns,
             event_id: 22,
             event_id_string: "22".to_string(),
@@ -1021,6 +1048,7 @@ mod tests {
             fields: EventFields::DnsQuery(crate::models::DnsQueryFields {
                 query_name: Some("foo.example.com".to_string()),
                 query_results: None,
+                record_type: None,
                 query_status: None,
                 process_id: None,
                 image: None,

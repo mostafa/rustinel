@@ -3,7 +3,6 @@
 //! Exposes core modules for use by binaries and tests.
 
 pub mod alerts;
-pub mod collector;
 pub mod config;
 pub mod engine;
 pub mod ioc;
@@ -12,5 +11,6 @@ pub mod normalizer;
 pub mod reload;
 pub mod response;
 pub mod scanner;
+pub mod sensor;
 pub mod state;
 pub mod utils;

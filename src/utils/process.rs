@@ -1,4 +1,27 @@
-//! Process utilities (Windows-only helpers).
+//! Process utilities.
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcessDetails {
+    pub image: Option<String>,
+    pub command_line: Option<String>,
+    pub parent_process_id: Option<u32>,
+    pub parent_image: Option<String>,
+    pub parent_command_line: Option<String>,
+    pub current_directory: Option<String>,
+    /// Linux `/proc/<pid>/stat` start time in clock ticks since boot.
+    pub start_time: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+struct ProcStat {
+    parent_process_id: Option<u32>,
+    start_time: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+use std::fs;
 
 #[cfg(windows)]
 use windows::Win32::Foundation::{CloseHandle, HANDLE, UNICODE_STRING};
@@ -99,7 +122,100 @@ pub fn query_process_command_line(pid: u32) -> Option<String> {
     cmd
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn query_process_command_line(pid: u32) -> Option<String> {
+    read_proc_cmdline(pid)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn query_process_command_line(_pid: u32) -> Option<String> {
     None
+}
+
+#[cfg(target_os = "linux")]
+pub fn query_process_details(pid: u32) -> Option<ProcessDetails> {
+    if pid == 0 {
+        return None;
+    }
+
+    let proc_stat = read_proc_stat(pid);
+    let parent_process_id = proc_stat.as_ref().and_then(|stat| stat.parent_process_id);
+    let details = ProcessDetails {
+        image: read_proc_link(pid, "exe"),
+        command_line: read_proc_cmdline(pid),
+        parent_process_id,
+        parent_image: parent_process_id.and_then(|ppid| read_proc_link(ppid, "exe")),
+        parent_command_line: parent_process_id.and_then(read_proc_cmdline),
+        current_directory: read_proc_link(pid, "cwd"),
+        start_time: proc_stat.and_then(|stat| stat.start_time),
+    };
+
+    if details == ProcessDetails::default() {
+        None
+    } else {
+        Some(details)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_cmdline(pid: u32) -> Option<String> {
+    let raw = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let parts: Vec<String> = raw
+        .split(|byte| *byte == 0)
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| String::from_utf8_lossy(segment).into_owned())
+        .collect();
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_link(pid: u32, name: &str) -> Option<String> {
+    let path = fs::read_link(format!("/proc/{pid}/{name}")).ok()?;
+    Some(path.to_string_lossy().into_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_stat(pid: u32) -> Option<ProcStat> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let end = stat.rfind(')')?;
+    let rest = stat.get(end + 2..)?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    if fields.len() <= 19 {
+        return None;
+    }
+
+    Some(ProcStat {
+        parent_process_id: fields.get(1).and_then(|value| value.parse::<u32>().ok()),
+        start_time: fields.get(19).and_then(|value| value.parse::<u64>().ok()),
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_current_process_details_returns_linux_proc_metadata() {
+        let pid = std::process::id();
+        let details = query_process_details(pid).expect("current process details should exist");
+
+        assert!(details.image.is_some());
+        assert!(details.command_line.is_some());
+        assert!(details.parent_process_id.is_some());
+        assert!(details.current_directory.is_some());
+        assert!(details.start_time.is_some());
+    }
+
+    #[test]
+    fn query_current_process_command_line_returns_non_empty_string() {
+        let pid = std::process::id();
+        let command_line =
+            query_process_command_line(pid).expect("current process command line should exist");
+        assert!(!command_line.is_empty());
+    }
 }

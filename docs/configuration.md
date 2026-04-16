@@ -1,21 +1,23 @@
 # Configuration
 
-Rustinel loads configuration from four sources in order of precedence:
+Rustinel loads configuration from four sources in this order:
 
-1. CLI flags (highest, run mode only)
-2. Environment variables
+1. CLI flags where supported
+2. Environment variables using the `EDR__` prefix
 3. `config.toml` in the current working directory
-4. Built-in defaults (lowest)
+4. Built-in defaults
 
 ## Configuration File
 
-Place `config.toml` in the current working directory when you start Rustinel. The
-file name is resolved as `config` by the config loader, so `config.toml` is the
-recommended format.
+Place `config.toml` in the directory you launch Rustinel from, or use absolute paths throughout.
 
-For service deployments, the working directory is the service process directory
-(often `C:\Windows\System32`). Use absolute paths or environment overrides for
-rules and log locations.
+Production note:
+
+- Windows services often run with `C:\Windows\System32` as the working directory.
+- Linux service managers can also start in a directory that is not your install root.
+- For production, prefer absolute paths for rules, logs, and alerts.
+
+## Example `config.toml`
 
 ```toml
 [scanner]
@@ -28,17 +30,8 @@ yara_rules_path = "rules/yara"
 enabled = true
 debounce_ms = 2000
 
-[allowlist]
-paths = [
-  "C:\\Windows\\",
-  "C:\\Program Files\\",
-  "C:\\Program Files (x86)\\",
-]
-
 [logging]
 level = "info"
-# Optional target-aware override (takes precedence over level when set)
-# filter = "info,engine=info,scanner=info,ioc=info,rustinel::normalizer=info"
 directory = "logs"
 filename = "rustinel.log"
 console_output = true
@@ -46,6 +39,7 @@ console_output = true
 [alerts]
 directory = "logs"
 filename = "alerts.json"
+match_debug = "off"
 
 [response]
 enabled = false
@@ -69,156 +63,200 @@ default_severity = "high"
 max_file_size_mb = 50
 ```
 
+Use Windows path prefixes on Windows and Unix path prefixes on Linux.
+
+## Platform-Aware Defaults
+
+### Shared Defaults
+
+| Option | Default |
+| --- | --- |
+| `scanner.sigma_enabled` | `true` |
+| `scanner.sigma_rules_path` | `rules/sigma` |
+| `scanner.yara_enabled` | `true` |
+| `scanner.yara_rules_path` | `rules/yara` |
+| `reload.enabled` | `true` |
+| `reload.debounce_ms` | `2000` |
+| `logging.level` | `info` |
+| `logging.directory` | `logs` |
+| `logging.filename` | `rustinel.log` |
+| `logging.console_output` | `true` |
+| `alerts.directory` | `logs` |
+| `alerts.filename` | `alerts.json` |
+| `alerts.match_debug` | `off` |
+| `response.enabled` | `false` |
+| `response.prevention_enabled` | `false` |
+| `response.min_severity` | `critical` |
+| `ioc.enabled` | `true` |
+| `ioc.default_severity` | `high` |
+| `ioc.max_file_size_mb` | `50` |
+
+### Default Trusted Paths
+
+These defaults feed `allowlist.paths`, which then propagate to active response, YARA allowlists, and IOC hash allowlists unless a module-specific override is set.
+
+#### Windows
+
+- `C:\Windows\`
+- `C:\Program Files\`
+- `C:\Program Files (x86)\`
+
+#### Linux
+
+- `/usr/bin/`
+- `/usr/sbin/`
+- `/usr/lib/`
+- `/usr/lib64/`
+- `/usr/libexec/`
+- `/bin/`
+- `/sbin/`
+- `/lib/`
+- `/lib64/`
+
 ## Options
 
 ### Scanner
 
 | Option | Default | Description |
-|--------|---------|-------------|
-| `sigma_enabled` | `true` | Enable Sigma rule engine |
-| `sigma_rules_path` | `rules/sigma` | Path to Sigma rules directory (relative to working directory unless absolute) |
-| `yara_enabled` | `true` | Enable YARA scanner |
-| `yara_rules_path` | `rules/yara` | Path to YARA rules directory (relative to working directory unless absolute) |
-| `yara_allowlist_paths` | inherits `allowlist.paths` | Prefix paths skipped by YARA scan queue/worker (case-insensitive). Optional module-specific override |
+| --- | --- | --- |
+| `sigma_enabled` | `true` | Enable Sigma rule evaluation |
+| `sigma_rules_path` | `rules/sigma` | Sigma rules directory |
+| `yara_enabled` | `true` | Enable YARA scanning |
+| `yara_rules_path` | `rules/yara` | YARA rules directory |
+| `yara_allowlist_paths` | inherits `allowlist.paths` | Prefix paths skipped by YARA queueing and scanning |
 
-### Hot Reload
+### Reload
 
 | Option | Default | Description |
-|--------|---------|-------------|
-| `enabled` | `true` | Enable local file-based hot reload for Sigma, YARA, and IOC inputs |
-| `debounce_ms` | `2000` | Debounce window for coalescing burst filesystem events before rebuild/swap |
+| --- | --- | --- |
+| `enabled` | `true` | Enable local file-based hot reload for Sigma, YARA, and IOC files |
+| `debounce_ms` | `2000` | Debounce window before rebuilding detectors |
 
-Behavior notes:
-- The poll cadence is `max(reload.debounce_ms, 2000ms)`.
-- Empty reload results are rejected for safety (existing Sigma/YARA/IOC engines stay active).
+Reload notes:
+
+- Poll cadence is `max(reload.debounce_ms, 2000ms)`.
+- Empty rebuild results are rejected to keep the last good detector set live.
 
 ### Global Allowlist
 
 | Option | Default | Description |
-|--------|---------|-------------|
-| `paths` | `["C:\\Windows\\", "C:\\Program Files\\", "C:\\Program Files (x86)\\"]` | Shared trusted path prefixes propagated to Response/IOC hash/YARA unless module-specific overrides are set |
+| --- | --- | --- |
+| `paths` | platform-specific | Shared trusted path prefixes |
 
 Propagation behavior:
+
 - If `response.allowlist_paths` is empty, it inherits `allowlist.paths`.
 - If `ioc.hash_allowlist_paths` is empty, it inherits `allowlist.paths`.
 - If `scanner.yara_allowlist_paths` is empty, it inherits `allowlist.paths`.
-- Setting a module-specific list disables inheritance for that module only.
 
 ### Logging
 
 | Option | Default | Description |
-|--------|---------|-------------|
-| `level` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
-| `filter` | `null` | Optional `tracing_subscriber` filter expression (for example: `info,engine=trace,scanner=debug`). When set and valid, this overrides `level`. |
-| `directory` | `logs` | Log output directory |
-| `filename` | `rustinel.log` | Log filename (daily rotation applied) |
-| `console_output` | `true` | Mirror logs to stdout |
-
-Rule logic evaluation errors from Sigma are only emitted at `warn`, `debug`, or `trace` levels.
+| --- | --- | --- |
+| `level` | `info` | Base log level: `trace`, `debug`, `info`, `warn`, `error` |
+| `filter` | `null` | Optional `tracing_subscriber` filter expression; overrides `level` when valid |
+| `directory` | `logs` | Operational log directory |
+| `filename` | `rustinel.log` | Operational log filename with daily rotation |
+| `console_output` | `true` | Mirror logs to stdout. On Windows, colored output requires [Windows Terminal](https://aka.ms/terminal) — other terminals (cmd.exe, PowerShell host) will display plain text automatically. |
 
 ### Alerts
 
 | Option | Default | Description |
-|--------|---------|-------------|
-| `directory` | `logs` | Alert output directory |
-| `filename` | `alerts.json` | Alert filename (NDJSON, daily rotation) |
+| --- | --- | --- |
+| `directory` | `logs` | Alert directory |
+| `filename` | `alerts.json` | ECS NDJSON filename with daily rotation |
+| `match_debug` | `off` | `off`, `summary`, or `full` match metadata in alerts |
 
 ### Active Response
 
 | Option | Default | Description |
-|--------|---------|-------------|
-| `enabled` | `false` | Enable active response engine |
-| `prevention_enabled` | `false` | If `false`, log dry-run actions only |
-| `min_severity` | `critical` | Minimum severity to respond to: `low`, `medium`, `high`, `critical` |
-| `channel_capacity` | `128` | Queue size for response tasks (drops on overflow) |
+| --- | --- | --- |
+| `enabled` | `false` | Enable the response engine |
+| `prevention_enabled` | `false` | If `false`, actions are logged but not executed |
+| `min_severity` | `critical` | Minimum severity to act on |
+| `channel_capacity` | `128` | Queue size for response work |
 | `allowlist_images` | `[]` | Image basenames or full paths to skip |
-| `allowlist_paths` | inherits `allowlist.paths` | Prefix paths to skip (case-insensitive). Optional module-specific override |
+| `allowlist_paths` | inherits `allowlist.paths` | Module-specific trusted prefixes |
 
-See `docs/active-response.md` for behavior and testing guidance.
+See [Active Response](active-response.md) for platform behavior and safe testing.
 
 ### Network
 
 | Option | Default | Description |
-|--------|---------|-------------|
-| `aggregation_enabled` | `true` | Enable connection aggregation to reduce event volume |
-| `aggregation_max_entries` | `20000` | Maximum unique connections to track |
-| `aggregation_interval_buffer_size` | `50` | Intervals to store for beacon detection |
+| --- | --- | --- |
+| `aggregation_enabled` | `true` | Enable repeated-connection suppression |
+| `aggregation_max_entries` | `20000` | Maximum unique connections tracked |
+| `aggregation_interval_buffer_size` | `50` | Timing intervals retained per aggregated connection |
 
-Connection aggregation suppresses repeated connections from the same process to the same destination,
-emitting only the first connection. Timing data is collected for future beacon detection analysis.
-
-### IOC (Atomic Indicators)
+### IOC
 
 | Option | Default | Description |
-|--------|---------|-------------|
-| `enabled` | `true` | Enable atomic IOC detection |
-| `hashes_path` | `rules/ioc/hashes.txt` | Hash IOC file (MD5/SHA1/SHA256) |
+| --- | --- | --- |
+| `enabled` | `true` | Enable IOC detection |
+| `hashes_path` | `rules/ioc/hashes.txt` | Hash IOC file |
 | `ips_path` | `rules/ioc/ips.txt` | IP and CIDR IOC file |
 | `domains_path` | `rules/ioc/domains.txt` | Domain IOC file |
-| `paths_regex_path` | `rules/ioc/paths_regex.txt` | Path/filename regex IOC file |
+| `paths_regex_path` | `rules/ioc/paths_regex.txt` | Path regex IOC file |
 | `default_severity` | `high` | Severity assigned to IOC alerts |
-| `max_file_size_mb` | `50` | Skip hashing files larger than this (MB). Set to `0` to disable the limit |
-| `hash_allowlist_paths` | inherits `allowlist.paths` | Prefix paths to skip hashing (case-insensitive). Optional module-specific override |
-
-Path regexes are compiled case-insensitive by default (Windows path semantics).
-Hash IOCs are evaluated on process start only in a dedicated blocking worker thread.
-Files under allowlisted paths (shared `allowlist.paths` by default) and files exceeding `max_file_size_mb` are skipped.
-A file identity cache (path + size + mtime) avoids re-hashing unchanged binaries.
+| `max_file_size_mb` | `50` | Skip hashing files larger than this limit |
+| `hash_allowlist_paths` | inherits `allowlist.paths` | Prefix paths skipped during hashing |
 
 ## Environment Variables
 
-Override any setting using the `EDR__` prefix with double underscore separators:
+The environment prefix is `EDR__`. Nested keys use double underscores.
+
+### PowerShell
 
 ```powershell
 $env:EDR__LOGGING__LEVEL="debug"
-$env:EDR__LOGGING__FILTER="info,engine=debug,scanner=info,ioc=debug,rustinel::normalizer=info"
-$env:EDR__SCANNER__SIGMA_RULES_PATH="C:\\custom\\sigma"
-$env:EDR__SCANNER__YARA_RULES_PATH="C:\\custom\\yara"
-$env:EDR__RELOAD__DEBOUNCE_MS=2000
+$env:EDR__SCANNER__SIGMA_RULES_PATH="C:\\Rustinel\\rules\\sigma"
 $env:EDR__ALLOWLIST__PATHS='["C:\\Windows\\","C:\\Program Files\\"]'
-# optional module-specific override:
-$env:EDR__SCANNER__YARA_ALLOWLIST_PATHS='["C:\\Windows\\","D:\\Trusted\\"]'
+.\rustinel.exe run --console
+```
 
-rustinel run
+### Bash
+
+```bash
+export EDR__LOGGING__LEVEL=debug
+export EDR__SCANNER__SIGMA_RULES_PATH=/opt/rustinel/rules/sigma
+export EDR__ALLOWLIST__PATHS='["/usr/bin/","/usr/sbin/"]'
+sudo /opt/rustinel/rustinel run
 ```
 
 ## CLI Overrides
 
-Only the log level can be overridden via CLI:
+The only CLI override today is log level on interactive `run` usage. For repeatable cross-platform deployments, prefer `config.toml` and `EDR__...` environment variables.
 
 ```powershell
 rustinel run --log-level debug
 ```
 
-CLI flags apply to `run` only. Service management commands do not pass flags to the service process.
+## Practical Examples
 
-## Examples
-
-### Minimal Config (Sigma Only)
+### Windows Service-Friendly Paths
 
 ```toml
 [scanner]
-yara_enabled = false
-```
-
-### Debug Mode
-
-```toml
-[logging]
-level = "debug"
-console_output = true
-```
-
-### Custom Paths
-
-```toml
-[scanner]
-sigma_rules_path = "C:\\SecurityRules\\sigma"
-yara_rules_path = "C:\\SecurityRules\\yara"
+sigma_rules_path = "C:\\Rustinel\\rules\\sigma"
+yara_rules_path = "C:\\Rustinel\\rules\\yara"
 
 [logging]
-directory = "C:\\Logs\\Rustinel"
+directory = "C:\\Rustinel\\logs"
 
 [alerts]
-directory = "C:\\Logs\\Rustinel"
+directory = "C:\\Rustinel\\logs"
+```
+
+### Linux Install Layout
+
+```toml
+[scanner]
+sigma_rules_path = "/opt/rustinel/rules/sigma"
+yara_rules_path = "/opt/rustinel/rules/yara"
+
+[logging]
+directory = "/opt/rustinel/logs"
+
+[alerts]
+directory = "/opt/rustinel/logs"
 ```

@@ -2,28 +2,29 @@
 
 ## Usage
 
-```
+```text
 rustinel [COMMAND] [OPTIONS]
 ```
 
-## Global Options
+Running `rustinel` without a subcommand is equivalent to `rustinel run`.
 
-- `--log-level <LEVEL>` - Override logging level for this run (`trace`, `debug`, `info`, `warn`, `error`). This is applied only to `run` and is ignored by service commands.
+## Global Option
+
+| Option | Description |
+| --- | --- |
+| `--log-level <LEVEL>` | Interactive log-level override. For production and cross-platform automation, prefer `config.toml` or `EDR__LOGGING__LEVEL`. |
 
 ## Commands
 
-### run
+### `run`
 
-Run in console mode with visible output.
+Run Rustinel in the foreground.
 
-```
+```text
 rustinel run [--console] [--log-level <LEVEL>]
 ```
 
-**Options:**
-- `--console` - Force console output regardless of config
-
-**Examples:**
+Examples:
 
 ```powershell
 rustinel run
@@ -31,17 +32,24 @@ rustinel run --console
 rustinel run --log-level debug
 ```
 
-### service
+```bash
+sudo ./rustinel run
+```
+
+Notes:
+
+- `--console` is primarily relevant on Windows console runs.
+- Linux foreground execution is the normal runtime model unless you wrap the binary in a service manager.
+
+### `service`
 
 Manage Windows service installation and lifecycle.
 
-```
+```text
 rustinel service <install|uninstall|start|stop>
 ```
 
-Service commands require an elevated PowerShell.
-
-**Examples:**
+Examples:
 
 ```powershell
 rustinel service install
@@ -50,20 +58,16 @@ rustinel service stop
 rustinel service uninstall
 ```
 
-## Default Behavior
+Platform note:
 
-Running `rustinel` without arguments is equivalent to `rustinel run`.
-
-## Exit Codes
-
-| Code | Meaning |
-|------|---------|
-| 0 | Success |
-| 1 | Error (check logs for details) |
+- Service commands are supported on Windows only.
+- On Linux, use `systemd` or another process supervisor if you need background execution.
 
 ## Environment Variables
 
-Configuration can be overridden via environment variables using the `EDR__` prefix and double underscore separators.
+Common examples:
+
+### PowerShell
 
 ```powershell
 $env:EDR__LOGGING__LEVEL="debug"
@@ -71,10 +75,27 @@ $env:EDR__SCANNER__SIGMA_ENABLED="true"
 rustinel run
 ```
 
-To clear a variable for the current shell:
+### Bash
 
-```powershell
-Remove-Item Env:EDR__LOGGING__LEVEL
+```bash
+export EDR__LOGGING__LEVEL=debug
+export EDR__SCANNER__SIGMA_ENABLED=true
+sudo ./rustinel run
 ```
 
-See [Configuration](configuration.md) for all available options.
+## Linux eBPF Override
+
+For Linux development, `RUSTINEL_EBPF_OBJECT` points the loader at a specific `.o` file instead of the embedded object:
+
+```bash
+sudo env RUSTINEL_EBPF_OBJECT=/opt/rustinel/ebpf/rustinel-ebpf.o ./rustinel run
+```
+
+## Exit Codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success |
+| `1` | Error |
+
+Check the operational log if startup or runtime initialization fails.

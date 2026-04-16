@@ -1,414 +1,141 @@
 # Rustinel
-**High-performance, user-mode Windows EDR in Rust**
+**Open-source endpoint detection for Windows and Linux**
 
 <p align="center">
   <a href="https://karib0u.github.io/rustinel/"><img src="https://img.shields.io/badge/docs-available-brightgreen" alt="Docs"></a>
-  <img src="https://img.shields.io/badge/platform-Windows-blue?logo=windows" alt="Platform Windows">
+  <img src="https://img.shields.io/badge/platform-Windows%20ETW-blue?logo=windows" alt="Platform Windows ETW">
+  <img src="https://img.shields.io/badge/platform-Linux%20eBPF-orange?logo=linux" alt="Platform Linux eBPF">
   <img src="https://img.shields.io/badge/language-Rust-orange?logo=rust" alt="Language Rust">
   <img src="https://img.shields.io/badge/license-Apache%202.0-green" alt="License">
-  <img src="https://img.shields.io/badge/status-Alpha-yellow" alt="Status">
+  <img src="https://img.shields.io/badge/status-Official%20Release%201.0-success" alt="Status">
 </p>
 
-Rustinel is a **high-throughput Windows EDR agent** written in **Rust**. It collects **kernel telemetry via ETW**, normalizes events into a **Sysmon-compatible schema**, detects threats using **Sigma** + **YARA**, and outputs alerts as **ECS NDJSON** for straightforward SIEM ingestion.
+Rustinel gives blue teams a simple, transparent way to collect host telemetry and run rule-based detections across **Windows** and **Linux**.
 
-> ✅ No kernel driver  
-> ✅ User-mode ETW pipeline  
-> ✅ Sigma behavioral detection, YARA scanning, IOCs detection
-> ✅ Local hot reload for Sigma/YARA/IOC files  
-> ✅ ECS NDJSON alerts + operational logs
+It uses **ETW** on Windows and **eBPF** on Linux, normalizes events into a shared model, evaluates **Sigma**, **YARA**, and **IOC** detections, writes **ECS NDJSON** alerts, and can optionally terminate malicious processes.
+
+Version **1.0.0** is the first official Rustinel release, with supported Windows ETW and Linux eBPF collectors.
 
 <p align="center">
   <img src="docs/images/demo.gif" alt="Rustinel Demo" width="900">
 </p>
 
----
+## Why Rustinel
 
-## Why Rustinel?
+- Native telemetry sources: ETW on Windows, eBPF on Linux
+- One shared detection pipeline across both platforms
+- Sigma, YARA, and IOC matching in one agent
+- Hot reload for rules and indicator files
+- ECS NDJSON alerts that fit easily into SIEM pipelines
+- Optional active response with dry-run and allowlists
 
-Rustinel is built for defenders who want:
-- **Kernel-grade telemetry** without kernel risk (ETW, user-mode)
-- **Performance under volume** (async pipeline + caching + noise reduction)
-- **Detection compatibility** (Sysmon-style normalization for Sigma)
-- **Operational simplicity** (NDJSON alerts on disk, easy to ship to a SIEM)
+## How It Works
 
----
+1. Rustinel collects raw host telemetry from ETW or eBPF.
+2. It normalizes that data into a shared event model.
+3. It evaluates Sigma, YARA, and IOC detections.
+4. It writes alerts to disk and can optionally apply response actions.
 
-## What it does
+## Platform Support
 
-Rustinel monitors Windows endpoints by:
-- Collecting kernel events via **ETW** (process, network, file, registry, DNS, PowerShell, WMI, services, tasks)
-- Normalizing ETW events into **Sysmon-compatible** fields
-- Detecting threats using **Sigma rules** and **YARA scanning**
-- Detecting **atomic IOCs** (hashes, IP/CIDR, domains, path regex)
-- Hot-reloading local Sigma/YARA/IOC files without process restart
-- Writing alerts in **ECS NDJSON** format
+| Platform | Sensor | Current coverage | Runtime model |
+| --- | --- | --- | --- |
+| Windows 10/11, Server 2016+ | ETW | Process, image load, network, file, registry, DNS, PowerShell, WMI, service, task | Foreground run or built-in Windows service commands |
+| Linux 5.8+ with BTF | eBPF | Process, network, file, DNS | Foreground run under root or your supervisor of choice |
 
----
+## Quick Start
 
-## Key features
+Download the release package for your platform from [GitHub Releases](https://github.com/Karib0u/rustinel/releases) and extract it.
 
-- **User-mode only**: no kernel driver required
-- **Dual detection engines**:
-  - **Sigma** for behavioral detection
-  - **YARA** for file scanning on process start
-- **Atomic IOC detection**: hashes, IP/CIDR, domains, path regex
-- **Local hot reload**: Sigma, YARA, and IOC files are reloaded in-place with atomic swaps
-- **Noise reduction**:
-  - keyword filtering at the ETW session
-  - router-level filtering for high-volume network events
-  - optional network connection aggregation
-- **Hot-path optimizations**:
-  - Sigma rules are filtered at load time (`category`/`product`/`service`)
-  - Sigma conditions are transpiled + precompiled at startup and on hot reload
-  - process-context enrichment is attached on alerts, not every event
-- **Enrichment**:
-  - NT → DOS path normalization
-  - PE metadata extraction (OriginalFileName/Product/Description)
-  - parent process correlation
-  - SID → `DOMAIN\User` resolution
-  - DNS caching and reverse mapping
-- **Windows service support** (install/start/stop/uninstall)
-- **ECS NDJSON alerts** for SIEM ingestion
-- **Optional active response** (dry-run or terminate on critical alerts)
+### Windows
 
----
-
-## Requirements
-
-- Windows 10/11 or Server 2016+
-- Administrator privileges (ETW + service management)
-- Rust 1.92+ (build from source)
-
----
-
-## Quick start
-
-> Run from an elevated PowerShell.
-
-**Option 1: Download Release (Recommended)**
-1. Download the latest release from [GitHub Releases](https://github.com/Karib0u/rustinel/releases).
-2. Extract the archive.
-3. Run from an elevated PowerShell:
-   ```powershell
-   .\rustinel.exe run --console
-   ```
-
-**Option 2: Build from Source**
+Download `rustinel-<version>-x86_64-pc-windows-msvc.zip`, extract it, then run:
 
 ```powershell
-# Build
-cargo build --release
-
-# Run (console output)
-.\target\release\rustinel.exe run --console
-````
-
-Running without arguments is equivalent to `rustinel run`.
-
----
-
-## 2-minute demo
-
-### Sigma demo
-
-This repo ships with an example rule: `rules/sigma/example_whoami.yml`
-
-1. Start Rustinel (admin shell):
-
-```powershell
-cargo run -- run --console
-```
-
-2. Trigger the rule:
-
-```powershell
+cd .\rustinel-<version>-x86_64-pc-windows-msvc
+.\rustinel.exe run --console
 whoami /all
 ```
 
-3. Verify an alert was written:
+### Linux
 
-* `logs/alerts.json.YYYY-MM-DD`
+Choose the archive that matches your architecture:
 
----
+- `rustinel-<version>-x86_64-unknown-linux-musl.tar.gz`
+- `rustinel-<version>-aarch64-unknown-linux-musl.tar.gz`
 
-### YARA demo
+Then extract and run:
 
-This repo ships with an example rule: `rules/yara/example_test_string.yar`
+```bash
+tar xzf rustinel-<version>-x86_64-unknown-linux-musl.tar.gz
+cd rustinel-<version>-x86_64-unknown-linux-musl
+sudo ./rustinel run
+whoami
+```
 
-1. Build the demo binary:
+If startup fails with `tracefs not found`, mount the tracing filesystems and retry:
+
+```bash
+mount -t tracefs tracefs /sys/kernel/tracing
+mount -t debugfs debugfs /sys/kernel/debug
+```
+
+The bundled Sigma demo rule should write an alert to `logs/alerts.json.<date>`.
+
+## Compile From Source
+
+If you prefer to build locally instead of using a published release, use `cargo build --release`.
+
+### Windows
 
 ```powershell
-rustc .\examples\yara_demo.rs -o .\examples\yara_demo.exe
+cargo build --release
+.\target\release\rustinel.exe run --console
 ```
 
-2. Run it:
+### Linux
 
-```powershell
-.\examples\yara_demo.exe
+```bash
+cargo build --release
+sudo ./target/release/rustinel run
 ```
 
-3. Verify an alert includes the rule name:
+For full release setup, source-build prerequisites, and validation steps, see [Getting Started](https://karib0u.github.io/rustinel/getting-started/).
 
-* `ExampleMarkerString`
+## Detection
 
-**Note:** The demo binary runs in a loop to demonstrate active response. With response enabled and `prevention_enabled = true`, the process will be automatically terminated when the YARA rule triggers (YARA matches are treated as `critical` severity).
-
----
-
-## Service mode
-
-```powershell
-.\target\release\rustinel.exe service install
-.\target\release\rustinel.exe service start
-.\target\release\rustinel.exe service stop
-.\target\release\rustinel.exe service uninstall
-```
-
-**Notes**
-
-* `service install` registers the *current executable path* — run it from the final location.
-* Config and rules paths resolve from the working directory; for services, prefer absolute paths or env overrides.
-* Service runtime does not receive CLI flags; set log level via `config.toml` or `EDR__LOGGING__LEVEL`.
-
----
-
-## Configuration
-
-Configuration precedence:
-
-1. CLI flags (highest, run mode only)
-2. Environment variables
-3. `config.toml`
-4. Built-in defaults
-
-Example `config.toml`:
-
-```toml
-[scanner]
-sigma_enabled = true
-sigma_rules_path = "rules/sigma"
-yara_enabled = true
-yara_rules_path = "rules/yara"
-
-[reload]
-enabled = true
-debounce_ms = 2000
-
-[allowlist]
-paths = [
-  "C:\\Windows\\",
-  "C:\\Program Files\\",
-  "C:\\Program Files (x86)\\",
-]
-
-[logging]
-level = "info"
-directory = "logs"
-filename = "rustinel.log"
-console_output = true
-
-[alerts]
-directory = "logs"
-filename = "alerts.json"
-match_debug = "off" # off | summary | full
-
-[response]
-enabled = false
-prevention_enabled = false
-min_severity = "critical"
-channel_capacity = 128
-allowlist_images = []
-
-[network]
-aggregation_enabled = true
-aggregation_max_entries = 20000
-aggregation_interval_buffer_size = 50
-
-[ioc]
-enabled = true
-hashes_path = "rules/ioc/hashes.txt"
-ips_path = "rules/ioc/ips.txt"
-domains_path = "rules/ioc/domains.txt"
-paths_regex_path = "rules/ioc/paths_regex.txt"
-default_severity = "high"
-max_file_size_mb = 50
-```
-
-`allowlist.paths` is shared by default across:
-- `response.allowlist_paths`
-- `ioc.hash_allowlist_paths`
-- `scanner.yara_allowlist_paths`
-
-If a module-specific list is explicitly set, it overrides the shared list for that module only.
-
-Match debug output:
-1. `alerts.match_debug = "off"` disables match details in alerts (default).
-2. `alerts.match_debug = "summary"` adds rule condition + matched fields/patterns.
-3. `alerts.match_debug = "full"` adds matched values and YARA string snippets.
-
-Environment overrides:
-
-```powershell
-set EDR__LOGGING__LEVEL=debug
-set EDR__SCANNER__SIGMA_RULES_PATH=C:\rules\sigma
-set EDR__RELOAD__DEBOUNCE_MS=2000
-set EDR__ALLOWLIST__PATHS=["C:\\Windows\\","C:\\Program Files\\"]
-# optional module-specific override:
-set EDR__SCANNER__YARA_ALLOWLIST_PATHS=["C:\\Windows\\","D:\\Trusted\\"]
-```
-
-CLI override (highest precedence, run mode only):
-
-```powershell
-rustinel run --log-level debug
-```
-
-Note: rule logic evaluation errors are only logged at `warn`, `debug`, or `trace` levels (suppressed at `info`).
-
-### Hot reload
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `enabled` | `true` | Enable local file-based hot reload for Sigma, YARA, and IOC inputs |
-| `debounce_ms` | `2000` | Debounce window for coalescing burst file changes before rebuild/swap |
-
-Notes:
-- Poll cadence is `max(reload.debounce_ms, 2000ms)`.
-- Empty reload results are rejected for safety (previous compiled engines remain active).
-
-### Active response
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `enabled` | `false` | Enable active response engine |
-| `prevention_enabled` | `false` | If `false`, logs dry-run actions only |
-| `min_severity` | `critical` | Minimum severity to respond to (Sigma uses rule `level`, YARA is always treated as `critical`) |
-| `channel_capacity` | `128` | Queue size for response tasks (drops on overflow) |
-| `allowlist_images` | `[]` | Image basenames or full paths to skip |
-| `allowlist_paths` | inherits `allowlist.paths` | Prefix paths to skip (case-insensitive). Optional module-specific override |
-
-More details: `docs/active-response.md`.
-
-### Atomic IOC detection
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `enabled` | `true` | Enable atomic IOC detection |
-| `hashes_path` | `rules/ioc/hashes.txt` | Hash IOC file (MD5/SHA1/SHA256) |
-| `ips_path` | `rules/ioc/ips.txt` | IP and CIDR IOC file |
-| `domains_path` | `rules/ioc/domains.txt` | Domain IOC file |
-| `paths_regex_path` | `rules/ioc/paths_regex.txt` | Path/filename regex IOC file |
-| `default_severity` | `high` | Severity assigned to IOC alerts |
-| `max_file_size_mb` | `50` | Skip hashing files larger than this (MB) |
-| `hash_allowlist_paths` | inherits `allowlist.paths` | Prefix paths to skip hashing (case-insensitive). Optional module-specific override |
-
----
-
-## Rules
-
-### Sigma
-
-* Place `.yml` / `.yaml` files under `rules/sigma/`
-* Rules are compiled at startup and hot-reloaded when files change
-* Supported categories include:
-  `process_creation`, `network_connection`, `file_event`, `registry_event`,
-  `dns_query`, `image_load`, `ps_script`, `wmi_event`, `service_creation`, `task_creation`
-
-### YARA
-
-* Place `.yar` / `.yara` files under `rules/yara/`
-* Rules compile at startup and are hot-reloaded when files change
-* Scans trigger on **process creation** (runs in a background worker)
-* Files under allowlisted path prefixes are skipped (`allowlist.paths` by default or `scanner.yara_allowlist_paths` override)
-
-### Atomic IOCs
-
-Place indicator files under `rules/ioc/`:
-
-* `hashes.txt` — MD5, SHA1, SHA256 hashes (auto-detected by length)
-* `ips.txt` — IP addresses and CIDR ranges
-* `domains.txt` — exact domains or `*.`/`.` prefix for suffix matching
-* `paths_regex.txt` — case-insensitive regexes matched against file paths
-
-Hash checking runs in a dedicated background worker on process creation. Files under allowlisted paths (shared `allowlist.paths` by default, or `ioc.hash_allowlist_paths` override) and files exceeding `max_file_size_mb` are skipped automatically. Domain, IP, and path checks run inline with negligible overhead.
-IOC files are also hot-reloaded when they change.
-
----
+- **Sigma** for behavioral detections on normalized events
+- **YARA** for executable scanning on process-start events
+- **IOC** for domains, IPs, path regexes, and file hashes
 
 ## Output
 
-Rustinel produces:
+- Operational logs: `logs/rustinel.log.<date>`
+- Alerts: `logs/alerts.json.<date>`
+- Alert format: ECS 9.3.0 NDJSON
 
-* **Operational logs**: `logs/rustinel.log.YYYY-MM-DD`
-* **Security alerts** (ECS NDJSON): `logs/alerts.json.YYYY-MM-DD`
+## Best For
 
-Example alert (one JSON object per line):
+- Lab deployments and evaluations
+- Rule development and detection testing
+- Blue teams that want transparent host telemetry and file-based alert output
+- Cross-platform detection work without maintaining separate Windows and Linux pipelines
 
-```json
-{
-  "@timestamp": "2025-01-15T14:32:10Z",
-  "event.kind": "alert",
-  "event.category": "process",
-  "event.action": "process_creation",
-  "rule.name": "Whoami Execution",
-  "rule.severity": "low",
-  "rule.engine": "Sigma",
-  "process.executable": "C:\\Windows\\System32\\whoami.exe",
-  "process.command_line": "whoami /all",
-  "user.name": "DOMAIN\\username"
-}
-```
+## Documentation
 
----
-
-## Development
-
-```powershell
-# Unit tests
-cargo test
-
-# Format + lint
-cargo fmt
-cargo clippy
-
-# Validate Sigma + YARA rules
-cargo run --bin validate_rules
-```
-
-Project layout (high level):
-
-```text
-src/
-├── collector/     # ETW collection + routing
-├── normalizer/    # Sysmon-style normalization + enrichment
-├── engine/        # Sigma engine
-├── scanner/       # YARA scanning worker
-├── ioc/           # Atomic IOC detection (hashes, IPs, domains, paths)
-├── state/         # caches (process/sid/dns/aggregation)
-└── bin/validate_rules.rs
-```
-
----
-
-## Roadmap
-
-Short roadmap:
-- YARA expansion (memory scanning + periodic scans).
-- Resource governor (Windows Job Objects CPU limits).
-- Self-defense hardening (DACL/ACL restrictions + anti-injection).
-- Watchdog sidecar to restart the service if the main process dies.
-- ETW integrity checks to detect blinding/tampering.
-- Deep inspection via stack tracing for "floating code".
-
----
+- [Documentation Home](https://karib0u.github.io/rustinel/)
+- [Getting Started](https://karib0u.github.io/rustinel/getting-started/)
+- [Configuration](https://karib0u.github.io/rustinel/configuration/)
+- [Detection](https://karib0u.github.io/rustinel/detection/)
+- [Architecture](https://karib0u.github.io/rustinel/architecture/)
+- [Operations and Upgrade Guide](https://karib0u.github.io/rustinel/operations/)
+- [Troubleshooting](https://karib0u.github.io/rustinel/troubleshooting/)
+- [FAQ](https://karib0u.github.io/rustinel/faq/)
 
 ## Status
 
-Rustinel is **Alpha**. It’s usable for experimentation, lab deployments, and iterative hardening.
-Expect breaking changes while the schema + engines mature.
-
----
+Rustinel **1.0.0** is the first official release. **Windows** and **Linux** are supported platforms. Windows telemetry coverage is still broader than Linux today, while Linux currently covers process, network, file, and DNS telemetry through eBPF.
 
 ## License
 
-Apache 2.0 — see `LICENSE`.
+Apache 2.0. See `LICENSE`.

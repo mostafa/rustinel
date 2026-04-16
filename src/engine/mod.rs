@@ -13,7 +13,7 @@ use evalexpr::*;
 use ipnetwork::IpNetwork;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::IpAddr;
 use std::path::Path;
@@ -24,6 +24,7 @@ use crate::models::{
     Alert, AlertSeverity, DetectionEngine, EventCategory, MatchDebugLevel, MatchDetails,
     NormalizedEvent, SigmaFieldMatch, SigmaKeywordMatch, SigmaMatchDetails,
 };
+use crate::sensor::Platform;
 
 // ============================================================================
 // Lazy-initialized Regular Expressions
@@ -128,6 +129,82 @@ pub struct LogSource {
     pub service: Option<String>,
 }
 
+/// Normalized Sigma logsource key used for rule indexing and event routing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct LogSourceKey {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+}
+
+impl LogSourceKey {
+    fn normalize_value(value: Option<&str>) -> Option<String> {
+        value
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+    }
+
+    pub fn from_logsource(logsource: &LogSource) -> Self {
+        Self {
+            product: Self::normalize_value(logsource.product.as_deref()),
+            service: Self::normalize_value(logsource.service.as_deref()),
+            category: Self::normalize_value(logsource.category.as_deref()),
+        }
+    }
+
+    fn from_parts(product: Option<&str>, service: Option<&str>, category: Option<&str>) -> Self {
+        Self {
+            product: product.map(ToString::to_string),
+            service: service.map(ToString::to_string),
+            category: category.map(ToString::to_string),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.product.is_none() && self.service.is_none() && self.category.is_none()
+    }
+
+    fn matches_tuple(&self, tuple: &Self) -> bool {
+        self.product
+            .as_deref()
+            .map(|value| tuple.product.as_deref() == Some(value))
+            .unwrap_or(true)
+            && self
+                .service
+                .as_deref()
+                .map(|value| tuple.service.as_deref() == Some(value))
+                .unwrap_or(true)
+            && self
+                .category
+                .as_deref()
+                .map(|value| tuple.category.as_deref() == Some(value))
+                .unwrap_or(true)
+    }
+
+    pub fn display(&self) -> String {
+        let mut parts = Vec::new();
+
+        if let Some(product) = &self.product {
+            parts.push(format!("product: {}", product));
+        }
+        if let Some(service) = &self.service {
+            parts.push(format!("service: {}", service));
+        }
+        if let Some(category) = &self.category {
+            parts.push(format!("category: {}", category));
+        }
+
+        if parts.is_empty() {
+            "<empty logsource>".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
+}
+
 /// Detection definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Detection {
@@ -223,8 +300,8 @@ pub struct CompiledRule {
     /// Compiled selections (new structure)
     pub selections: HashMap<String, Selection>,
 
-    /// Logsource category
-    pub category: String,
+    /// Normalized Sigma logsource
+    pub logsource: LogSourceKey,
 
     /// Pre-transpiled condition expression (evalexpr syntax) when present
     pub transpiled_condition: Option<String>,
@@ -233,11 +310,54 @@ pub struct CompiledRule {
     pub condition_tree: Option<Node>,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum RuleSkipReason {
-    Product,
-    Service,
-    Category,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleLoadDecision {
+    Load { collector_active: bool },
+    ProductMismatch,
+    Deferred,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)] // Used by companion binaries outside the library crate.
+pub enum LogSourceStatus {
+    Supported,
+    ProductMismatch,
+    Deferred,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(dead_code)] // Used by companion binaries outside the library crate.
+pub struct LogSourceClassification {
+    pub status: LogSourceStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collector_active: Option<bool>,
+}
+
+fn current_platform() -> Platform {
+    #[cfg(windows)]
+    {
+        Platform::Windows
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        Platform::Linux
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        Platform::Windows
+    }
+}
+
+fn platform_product(platform: Platform) -> &'static str {
+    match platform {
+        Platform::Windows => "windows",
+        Platform::Linux => "linux",
+    }
 }
 
 /// Field pattern for matching
@@ -280,8 +400,10 @@ pub enum FieldPattern {
 
 /// Sigma detection engine
 pub struct Engine {
-    /// Compiled rules indexed by category
-    rules_by_category: HashMap<String, Vec<CompiledRule>>,
+    /// Platform whose Sigma logsource rules should be accepted.
+    platform: Platform,
+    /// Compiled rules indexed by normalized logsource.
+    rules_by_logsource: HashMap<LogSourceKey, Vec<CompiledRule>>,
 
     /// Total number of loaded rules
     rule_count: usize,
@@ -292,11 +414,20 @@ pub struct Engine {
     /// Rules skipped at load time due to unsupported logsource product.
     skipped_product_rules: usize,
 
-    /// Rules skipped at load time due to unsupported logsource service.
-    skipped_service_rules: usize,
+    /// Rules skipped at load time because the logsource family is explicitly deferred.
+    skipped_deferred_rules: usize,
 
-    /// Rules skipped at load time due to unsupported/irrelevant category.
-    skipped_category_rules: usize,
+    /// Rules skipped at load time because the logsource shape is unknown.
+    skipped_unknown_logsource_rules: usize,
+
+    /// Rules that loaded successfully but do not currently have an active collector.
+    inactive_collector_rules: usize,
+
+    /// Deferred logsource counts by normalized tuple.
+    deferred_logsource_counts: HashMap<LogSourceKey, usize>,
+
+    /// Unknown logsource counts by normalized tuple.
+    unknown_logsource_counts: HashMap<LogSourceKey, usize>,
 
     /// Controls logging for rule logic evaluation errors.
     rule_logic_error_log_level: RuleLogicErrorLogLevel,
@@ -308,7 +439,13 @@ pub struct Engine {
 impl Engine {
     /// Creates a new engine instance
     pub fn new() -> Self {
-        Self::new_with_rule_logic_error_log_level_and_match_debug(
+        Self::new_for_platform(current_platform())
+    }
+
+    /// Creates a new engine instance for an explicit sensor platform.
+    pub fn new_for_platform(platform: Platform) -> Self {
+        Self::new_for_platform_with_rule_logic_error_log_level_and_match_debug(
+            platform,
             RuleLogicErrorLogLevel::Warn,
             MatchDebugLevel::Off,
         )
@@ -319,7 +456,11 @@ impl Engine {
     #[allow(dead_code)]
     pub fn new_with_logging_level(logging_level: &str) -> Self {
         let level = RuleLogicErrorLogLevel::from_logging_level(logging_level);
-        Self::new_with_rule_logic_error_log_level_and_match_debug(level, MatchDebugLevel::Off)
+        Self::new_for_platform_with_rule_logic_error_log_level_and_match_debug(
+            current_platform(),
+            level,
+            MatchDebugLevel::Off,
+        )
     }
 
     /// Creates a new engine instance that also configures match debug verbosity.
@@ -327,21 +468,43 @@ impl Engine {
         logging_level: &str,
         match_debug: MatchDebugLevel,
     ) -> Self {
-        let level = RuleLogicErrorLogLevel::from_logging_level(logging_level);
-        Self::new_with_rule_logic_error_log_level_and_match_debug(level, match_debug)
+        Self::new_for_platform_with_logging_level_and_match_debug(
+            current_platform(),
+            logging_level,
+            match_debug,
+        )
     }
 
-    fn new_with_rule_logic_error_log_level_and_match_debug(
+    /// Creates a new engine instance for an explicit platform and match-debug setting.
+    pub fn new_for_platform_with_logging_level_and_match_debug(
+        platform: Platform,
+        logging_level: &str,
+        match_debug: MatchDebugLevel,
+    ) -> Self {
+        let level = RuleLogicErrorLogLevel::from_logging_level(logging_level);
+        Self::new_for_platform_with_rule_logic_error_log_level_and_match_debug(
+            platform,
+            level,
+            match_debug,
+        )
+    }
+
+    fn new_for_platform_with_rule_logic_error_log_level_and_match_debug(
+        platform: Platform,
         level: RuleLogicErrorLogLevel,
         match_debug: MatchDebugLevel,
     ) -> Self {
         Self {
-            rules_by_category: HashMap::new(),
+            platform,
+            rules_by_logsource: HashMap::new(),
             rule_count: 0,
             failed_rules: Vec::new(),
             skipped_product_rules: 0,
-            skipped_service_rules: 0,
-            skipped_category_rules: 0,
+            skipped_deferred_rules: 0,
+            skipped_unknown_logsource_rules: 0,
+            inactive_collector_rules: 0,
+            deferred_logsource_counts: HashMap::new(),
+            unknown_logsource_counts: HashMap::new(),
             rule_logic_error_log_level: level,
             match_debug,
         }
@@ -481,12 +644,51 @@ impl Engine {
         PatternMatcher::Default
     }
 
-    fn normalized_category(rule: &SigmaRule) -> Option<String> {
-        rule.logsource
-            .category
-            .as_deref()
-            .map(|value| value.trim().to_ascii_lowercase())
-            .filter(|value| !value.is_empty())
+    fn validate_modifiers(&self, field_name: &str, modifiers: &[&str]) -> Result<()> {
+        for modifier in modifiers {
+            let supported = matches!(
+                *modifier,
+                "contains"
+                    | "startswith"
+                    | "endswith"
+                    | "all"
+                    | "base64offset"
+                    | "cased"
+                    | "re"
+                    | "windash"
+                    | "fieldref"
+                    | "exists"
+                    | "cidr"
+                    | "base64"
+                    | "wide"
+                    | "utf16"
+                    | "utf16le"
+                    | "utf16be"
+                    | "lt"
+                    | "gt"
+                    | "lte"
+                    | "le"
+                    | "gte"
+                    | "ge"
+                    | "i"
+                    | "m"
+                    | "s"
+            );
+
+            if !supported {
+                return Err(anyhow::anyhow!(
+                    "Unsupported Sigma modifier '{}' on field '{}'",
+                    modifier,
+                    field_name
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn normalized_logsource(rule: &SigmaRule) -> LogSourceKey {
+        LogSourceKey::from_logsource(&rule.logsource)
     }
 
     fn is_supported_category(category: &str) -> bool {
@@ -497,11 +699,14 @@ impl Engine {
                 | "file_event"
                 | "file_create"
                 | "file_delete"
+                | "file_change"
+                | "file_rename"
                 | "registry_event"
                 | "registry_add"
                 | "registry_set"
                 | "registry_delete"
                 | "dns_query"
+                | "dns"
                 | "image_load"
                 | "ps_script"
                 | "wmi_event"
@@ -510,25 +715,9 @@ impl Engine {
         )
     }
 
-    fn is_supported_product(rule: &SigmaRule) -> bool {
-        let Some(product) = rule.logsource.product.as_deref() else {
-            return true;
-        };
-        let product = product.trim().to_ascii_lowercase();
-        product.is_empty() || product == "windows"
-    }
-
-    fn is_supported_service(rule: &SigmaRule) -> bool {
-        let Some(service) = rule.logsource.service.as_deref() else {
-            return true;
-        };
-        let service = service.trim().to_ascii_lowercase();
-        if service.is_empty() {
-            return true;
-        }
-
+    fn is_recognized_windows_service(service: &str) -> bool {
         matches!(
-            service.as_str(),
+            service,
             "sysmon"
                 | "security"
                 | "system"
@@ -543,31 +732,225 @@ impl Engine {
         )
     }
 
-    fn skip_reason_for_rule(rule: &SigmaRule) -> Option<RuleSkipReason> {
-        let Some(category) = Self::normalized_category(rule) else {
-            return Some(RuleSkipReason::Category);
-        };
-
-        if !Self::is_supported_category(&category) {
-            return Some(RuleSkipReason::Category);
-        }
-
-        if !Self::is_supported_product(rule) {
-            return Some(RuleSkipReason::Product);
-        }
-
-        if !Self::is_supported_service(rule) {
-            return Some(RuleSkipReason::Service);
-        }
-
-        None
+    fn is_deferred_linux_service(service: &str) -> bool {
+        matches!(
+            service,
+            "auditd"
+                | "auth"
+                | "sudo"
+                | "sshd"
+                | "cron"
+                | "syslog"
+                | "clamav"
+                | "vsftpd"
+                | "guacamole"
+                | "builtin"
+        )
     }
 
-    fn increment_skip_counter(&mut self, reason: RuleSkipReason) {
-        match reason {
-            RuleSkipReason::Product => self.skipped_product_rules += 1,
-            RuleSkipReason::Service => self.skipped_service_rules += 1,
-            RuleSkipReason::Category => self.skipped_category_rules += 1,
+    fn active_logsource_tuples(&self) -> Vec<LogSourceKey> {
+        let mut tuples = match self.platform {
+            Platform::Linux => vec![
+                LogSourceKey::from_parts(Some("linux"), Some("sysmon"), Some("process_creation")),
+                LogSourceKey::from_parts(Some("linux"), Some("sysmon"), Some("network_connection")),
+                LogSourceKey::from_parts(Some("linux"), Some("sysmon"), Some("file_event")),
+                LogSourceKey::from_parts(Some("linux"), Some("sysmon"), Some("file_create")),
+                LogSourceKey::from_parts(Some("linux"), Some("sysmon"), Some("file_delete")),
+                LogSourceKey::from_parts(Some("linux"), Some("sysmon"), Some("file_change")),
+                LogSourceKey::from_parts(Some("linux"), Some("sysmon"), Some("file_rename")),
+                LogSourceKey::from_parts(Some("linux"), Some("sysmon"), Some("dns_query")),
+            ],
+            Platform::Windows => vec![
+                LogSourceKey::from_parts(Some("windows"), Some("sysmon"), Some("process_creation")),
+                LogSourceKey::from_parts(
+                    Some("windows"),
+                    Some("sysmon"),
+                    Some("network_connection"),
+                ),
+                LogSourceKey::from_parts(Some("windows"), Some("sysmon"), Some("file_event")),
+                LogSourceKey::from_parts(Some("windows"), Some("sysmon"), Some("file_create")),
+                LogSourceKey::from_parts(Some("windows"), Some("sysmon"), Some("file_delete")),
+                LogSourceKey::from_parts(Some("windows"), Some("sysmon"), Some("file_change")),
+                LogSourceKey::from_parts(Some("windows"), Some("sysmon"), Some("file_rename")),
+                LogSourceKey::from_parts(Some("windows"), Some("sysmon"), Some("registry_event")),
+                LogSourceKey::from_parts(Some("windows"), Some("sysmon"), Some("registry_add")),
+                LogSourceKey::from_parts(Some("windows"), Some("sysmon"), Some("registry_set")),
+                LogSourceKey::from_parts(Some("windows"), Some("sysmon"), Some("registry_delete")),
+                LogSourceKey::from_parts(Some("windows"), Some("sysmon"), Some("image_load")),
+                LogSourceKey::from_parts(Some("windows"), Some("dns-client"), Some("dns_query")),
+                LogSourceKey::from_parts(Some("windows"), Some("dns"), Some("dns_query")),
+                LogSourceKey::from_parts(Some("windows"), Some("powershell"), Some("ps_script")),
+                LogSourceKey::from_parts(
+                    Some("windows"),
+                    Some("powershell-classic"),
+                    Some("ps_script"),
+                ),
+                LogSourceKey::from_parts(
+                    Some("windows"),
+                    Some("microsoft-windows-powershell"),
+                    Some("ps_script"),
+                ),
+                LogSourceKey::from_parts(Some("windows"), Some("wmi"), Some("wmi_event")),
+                LogSourceKey::from_parts(Some("windows"), Some("system"), Some("service_creation")),
+                LogSourceKey::from_parts(
+                    Some("windows"),
+                    Some("taskscheduler"),
+                    Some("task_creation"),
+                ),
+                LogSourceKey::from_parts(
+                    Some("windows"),
+                    Some("task scheduler"),
+                    Some("task_creation"),
+                ),
+            ],
+        };
+
+        tuples.push(LogSourceKey::from_parts(
+            None,
+            Some("connection"),
+            Some("network"),
+        ));
+        tuples.push(LogSourceKey::from_parts(None, Some("dns"), Some("network")));
+        tuples.push(LogSourceKey::from_parts(None, None, Some("dns")));
+
+        tuples
+    }
+
+    fn matches_active_logsource(&self, logsource: &LogSourceKey) -> bool {
+        self.active_logsource_tuples()
+            .iter()
+            .any(|tuple| logsource.matches_tuple(tuple))
+    }
+
+    fn is_known_but_inactive_logsource(&self, logsource: &LogSourceKey) -> bool {
+        let category = logsource.category.as_deref();
+        let service = logsource.service.as_deref();
+
+        match self.platform {
+            Platform::Linux => {
+                matches!(service, Some("dns"))
+                    && matches!(category, None | Some("network"))
+                    && logsource
+                        .product
+                        .as_deref()
+                        .map(|product| product == "linux")
+                        .unwrap_or(true)
+            }
+            Platform::Windows => {
+                let service_known = service
+                    .map(Self::is_recognized_windows_service)
+                    .unwrap_or(true);
+                let category_known = category
+                    .map(|category| category == "network" || Self::is_supported_category(category))
+                    .unwrap_or(true);
+
+                service_known
+                    && category_known
+                    && logsource
+                        .product
+                        .as_deref()
+                        .map(|product| product == "windows")
+                        .unwrap_or(true)
+            }
+        }
+    }
+
+    fn is_deferred_linux_logsource(&self, logsource: &LogSourceKey) -> bool {
+        if self.platform != Platform::Linux || logsource.product.as_deref() != Some("linux") {
+            return false;
+        }
+
+        if logsource.service.is_none() && logsource.category.is_none() {
+            return true;
+        }
+
+        logsource
+            .service
+            .as_deref()
+            .map(Self::is_deferred_linux_service)
+            .unwrap_or(false)
+    }
+
+    #[allow(dead_code)] // Used by companion binaries outside the library crate.
+    pub fn classify_logsource_key(&self, logsource: &LogSourceKey) -> LogSourceClassification {
+        let decision = self.rule_load_decision(logsource);
+        let status = match decision {
+            RuleLoadDecision::Load { .. } => LogSourceStatus::Supported,
+            RuleLoadDecision::ProductMismatch => LogSourceStatus::ProductMismatch,
+            RuleLoadDecision::Deferred => LogSourceStatus::Deferred,
+            RuleLoadDecision::Unknown => LogSourceStatus::Unknown,
+        };
+        let collector_active = match decision {
+            RuleLoadDecision::Load { collector_active } => Some(collector_active),
+            _ => None,
+        };
+
+        LogSourceClassification {
+            status,
+            collector_active,
+        }
+    }
+
+    #[allow(dead_code)] // Used by companion binaries outside the library crate.
+    pub fn classify_logsource(&self, logsource: &LogSource) -> LogSourceClassification {
+        self.classify_logsource_key(&LogSourceKey::from_logsource(logsource))
+    }
+
+    fn rule_load_decision(&self, logsource: &LogSourceKey) -> RuleLoadDecision {
+        if logsource.is_empty() {
+            return RuleLoadDecision::Unknown;
+        }
+
+        if let Some(product) = logsource.product.as_deref() {
+            if product != platform_product(self.platform) {
+                return RuleLoadDecision::ProductMismatch;
+            }
+        }
+
+        if self.is_deferred_linux_logsource(logsource) {
+            return RuleLoadDecision::Deferred;
+        }
+
+        if self.matches_active_logsource(logsource) {
+            return RuleLoadDecision::Load {
+                collector_active: true,
+            };
+        }
+
+        if self.is_known_but_inactive_logsource(logsource) {
+            return RuleLoadDecision::Load {
+                collector_active: false,
+            };
+        }
+
+        RuleLoadDecision::Unknown
+    }
+
+    fn record_skip_for_logsource(&mut self, decision: RuleLoadDecision, logsource: &LogSourceKey) {
+        match decision {
+            RuleLoadDecision::ProductMismatch => self.skipped_product_rules += 1,
+            RuleLoadDecision::Deferred => {
+                self.skipped_deferred_rules += 1;
+                *self
+                    .deferred_logsource_counts
+                    .entry(logsource.clone())
+                    .or_default() += 1;
+            }
+            RuleLoadDecision::Unknown => {
+                self.skipped_unknown_logsource_rules += 1;
+                *self
+                    .unknown_logsource_counts
+                    .entry(logsource.clone())
+                    .or_default() += 1;
+            }
+            RuleLoadDecision::Load {
+                collector_active: false,
+            } => {
+                self.inactive_collector_rules += 1;
+            }
+            RuleLoadDecision::Load {
+                collector_active: true,
+            } => {}
         }
     }
 
@@ -586,12 +969,19 @@ impl Engine {
         self.load_rules_recursive(rules_dir)?;
 
         info!("Loaded {} Sigma rules total", self.rule_count);
-        for (category, rules) in &self.rules_by_category {
-            info!("  Category '{}': {} rules", category, rules.len());
+        for (logsource, rules) in &self.rules_by_logsource {
+            info!(
+                "  Logsource '{}': {} rules",
+                logsource.display(),
+                rules.len()
+            );
         }
         info!(
-            "Skipped rules - category: {}, product: {}, service: {}",
-            self.skipped_category_rules, self.skipped_product_rules, self.skipped_service_rules
+            "Skipped rules - deferred: {}, unknown_logsource: {}, product_mismatch: {}, inactive_collectors: {}",
+            self.skipped_deferred_rules,
+            self.skipped_unknown_logsource_rules,
+            self.skipped_product_rules,
+            self.inactive_collector_rules
         );
 
         Ok(())
@@ -631,12 +1021,9 @@ impl Engine {
         Ok(())
     }
 
-    /// Load a single rule file (supports multi-document YAML for "action: global" rules)
-    fn load_rule<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
-        let content = fs::read_to_string(path.as_ref()).context("Failed to read rule file")?;
-
-        // Parse all YAML documents in the file (handles multi-document YAML)
-        let documents: Vec<serde_yaml::Value> = serde_yaml::Deserializer::from_str(&content)
+    /// Parse Sigma rule documents from YAML content, expanding `action: global` files.
+    pub fn parse_rule_documents(content: &str) -> Result<Vec<SigmaRule>> {
+        let documents: Vec<serde_yaml::Value> = serde_yaml::Deserializer::from_str(content)
             .map(serde_yaml::Value::deserialize)
             .collect::<Result<Vec<_>, _>>()
             .context("Failed to parse YAML documents")?;
@@ -645,7 +1032,6 @@ impl Engine {
             return Err(anyhow::anyhow!("No YAML documents found"));
         }
 
-        // Check if this is a global rule (action: global)
         let is_global = documents
             .first()
             .and_then(|doc| doc.get("action"))
@@ -654,15 +1040,12 @@ impl Engine {
             .unwrap_or(false);
 
         if is_global && documents.len() > 1 {
-            // Global rule: first document has metadata, rest have logsource + detection
             let global_metadata = &documents[0];
+            let mut rules = Vec::with_capacity(documents.len() - 1);
 
-            // Process each sub-rule (starting from document 1)
             for doc in &documents[1..] {
-                // Merge global metadata with sub-rule
                 let mut merged = global_metadata.clone();
 
-                // Override with sub-rule's logsource and detection
                 if let Some(logsource) = doc.get("logsource") {
                     merged["logsource"] = logsource.clone();
                 }
@@ -670,50 +1053,43 @@ impl Engine {
                     merged["detection"] = detection.clone();
                 }
 
-                // Remove the "action: global" field from merged rule
                 if let Some(mapping) = merged.as_mapping_mut() {
                     mapping.remove(serde_yaml::Value::String("action".to_string()));
                 }
 
-                // Deserialize the merged document
-                let rule: SigmaRule = serde_yaml::from_value(merged)
-                    .context("Failed to parse merged global sub-rule")?;
-
-                if let Some(reason) = Self::skip_reason_for_rule(&rule) {
-                    self.increment_skip_counter(reason);
-                    continue;
-                }
-
-                // Compile and add the rule
-                let compiled = self.compile_rule(rule)?;
-                let category = compiled.category.clone();
-                self.rules_by_category
-                    .entry(category)
-                    .or_default()
-                    .push(compiled);
-
-                self.rule_count += 1;
-            }
-        } else {
-            // Single rule or non-global multi-document (process first document only)
-            let rule: SigmaRule =
-                serde_yaml::from_value(documents[0].clone()).context("Failed to parse YAML")?;
-
-            if let Some(reason) = Self::skip_reason_for_rule(&rule) {
-                self.increment_skip_counter(reason);
-                return Ok(());
+                rules.push(
+                    serde_yaml::from_value(merged)
+                        .context("Failed to parse merged global sub-rule")?,
+                );
             }
 
-            // Compile the rule
+            return Ok(rules);
+        }
+
+        Ok(vec![
+            serde_yaml::from_value(documents[0].clone()).context("Failed to parse YAML")?
+        ])
+    }
+
+    /// Load a single rule file (supports multi-document YAML for "action: global" rules)
+    fn load_rule<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let content = fs::read_to_string(path.as_ref()).context("Failed to read rule file")?;
+
+        for rule in Self::parse_rule_documents(&content)? {
+            let logsource = Self::normalized_logsource(&rule);
+            let decision = self.rule_load_decision(&logsource);
+            self.record_skip_for_logsource(decision, &logsource);
+
+            if !matches!(decision, RuleLoadDecision::Load { .. }) {
+                continue;
+            }
+
             let compiled = self.compile_rule(rule)?;
-
-            // Add to appropriate category
-            let category = compiled.category.clone();
-            self.rules_by_category
-                .entry(category)
+            let key = compiled.logsource.clone();
+            self.rules_by_logsource
+                .entry(key)
                 .or_default()
                 .push(compiled);
-
             self.rule_count += 1;
         }
 
@@ -722,7 +1098,7 @@ impl Engine {
 
     /// Compile a Sigma rule into efficient matching patterns
     fn compile_rule(&self, rule: SigmaRule) -> Result<CompiledRule> {
-        let category = Self::normalized_category(&rule).unwrap_or_else(|| "unknown".to_string());
+        let logsource = Self::normalized_logsource(&rule);
 
         let mut patterns: HashMap<String, Vec<FieldPattern>> = HashMap::new();
         let mut selections: HashMap<String, Selection> = HashMap::new();
@@ -790,7 +1166,7 @@ impl Engine {
             rule,
             patterns,
             selections,
-            category,
+            logsource,
             transpiled_condition,
             condition_tree,
         })
@@ -808,6 +1184,7 @@ impl Engine {
             if let Some(field_key_str) = field_key.as_str() {
                 // Parse modifiers from the field key
                 let (field_name, modifiers) = self.parse_field_key(field_key_str);
+                self.validate_modifiers(field_name, &modifiers)?;
 
                 // Parse the field value with modifiers
                 let field_patterns = self.parse_field_value(field_value, &modifiers)?;
@@ -1734,20 +2111,20 @@ impl Engine {
     /// Check an event against loaded rules
     /// OPTIMIZED: Uses zero-copy field access instead of HashMap creation
     pub fn check_event(&self, event: &NormalizedEvent) -> Option<Alert> {
-        let categories = Self::sigma_categories_for_event(event);
+        let candidate_logsources = Self::sigma_logsources_for_event(event);
 
         // PERFORMANCE: Pass event directly - no HashMap allocation!
         // This eliminates 10,000+ heap allocations per second
 
-        for category in categories {
-            let Some(rules) = self.rules_by_category.get(category) else {
+        for logsource in candidate_logsources {
+            let Some(rules) = self.rules_by_logsource.get(&logsource) else {
                 continue;
             };
 
             tracing::trace!(
-                "Checking event against {} rule(s) in category '{}'",
+                "Checking event against {} rule(s) in logsource '{}'",
                 rules.len(),
-                category
+                logsource.display()
             );
 
             // Check each rule
@@ -1829,52 +2206,186 @@ impl Engine {
         None
     }
 
-    fn sigma_categories_for_event(event: &NormalizedEvent) -> Vec<&'static str> {
-        let mut categories = Vec::with_capacity(3);
+    fn sigma_logsources_for_event(event: &NormalizedEvent) -> Vec<LogSourceKey> {
+        let mut ordered = Vec::new();
+        let mut seen = HashSet::new();
+
+        for alias in Self::concrete_logsource_aliases_for_event(event) {
+            for candidate in Self::logsource_subsets(&alias) {
+                if seen.insert(candidate.clone()) {
+                    ordered.push(candidate);
+                }
+            }
+        }
+
+        ordered
+    }
+
+    fn concrete_logsource_aliases_for_event(event: &NormalizedEvent) -> Vec<LogSourceKey> {
+        let mut aliases = Vec::new();
 
         match event.category {
             EventCategory::Process => {
-                // Focus on process creation; process termination rules are less common and noisy.
-                categories.push("process_creation");
+                aliases.push(LogSourceKey::from_parts(
+                    Some(platform_product(event.platform)),
+                    Some("sysmon"),
+                    Some("process_creation"),
+                ));
             }
             EventCategory::Network => {
-                categories.push("network_connection");
+                aliases.push(LogSourceKey::from_parts(
+                    Some(platform_product(event.platform)),
+                    Some("sysmon"),
+                    Some("network_connection"),
+                ));
+                aliases.push(LogSourceKey::from_parts(
+                    None,
+                    Some("connection"),
+                    Some("network"),
+                ));
             }
             EventCategory::File => {
-                categories.push("file_event");
-                match event.opcode {
-                    64 | 65 => categories.push("file_create"),
-                    70 | 72 => categories.push("file_delete"),
-                    _ => {}
+                for category in Self::sigma_file_categories_for_event(event) {
+                    aliases.push(LogSourceKey::from_parts(
+                        Some(platform_product(event.platform)),
+                        Some("sysmon"),
+                        Some(category),
+                    ));
                 }
             }
             EventCategory::Registry => {
-                categories.push("registry_event");
-                match event.opcode {
-                    36 => categories.push("registry_add"),
-                    39 => categories.push("registry_set"),
-                    38 | 41 => categories.push("registry_delete"),
-                    _ => {}
+                for category in Self::sigma_registry_categories_for_event(event) {
+                    aliases.push(LogSourceKey::from_parts(
+                        Some(platform_product(event.platform)),
+                        Some("sysmon"),
+                        Some(category),
+                    ));
                 }
             }
             EventCategory::Dns => {
-                categories.push("dns_query");
+                match event.platform {
+                    Platform::Windows => {
+                        aliases.push(LogSourceKey::from_parts(
+                            Some("windows"),
+                            Some("dns-client"),
+                            Some("dns_query"),
+                        ));
+                        aliases.push(LogSourceKey::from_parts(
+                            Some("windows"),
+                            Some("dns"),
+                            Some("dns_query"),
+                        ));
+                    }
+                    Platform::Linux => {
+                        aliases.push(LogSourceKey::from_parts(
+                            Some("linux"),
+                            Some("sysmon"),
+                            Some("dns_query"),
+                        ));
+                    }
+                }
+
+                aliases.push(LogSourceKey::from_parts(None, None, Some("dns")));
+                aliases.push(LogSourceKey::from_parts(None, Some("dns"), Some("network")));
             }
             EventCategory::ImageLoad => {
-                categories.push("image_load");
+                aliases.push(LogSourceKey::from_parts(
+                    Some(platform_product(event.platform)),
+                    Some("sysmon"),
+                    Some("image_load"),
+                ));
             }
             EventCategory::Scripting => {
-                categories.push("ps_script");
+                aliases.push(LogSourceKey::from_parts(
+                    Some("windows"),
+                    Some("powershell"),
+                    Some("ps_script"),
+                ));
+                aliases.push(LogSourceKey::from_parts(
+                    Some("windows"),
+                    Some("powershell-classic"),
+                    Some("ps_script"),
+                ));
+                aliases.push(LogSourceKey::from_parts(
+                    Some("windows"),
+                    Some("microsoft-windows-powershell"),
+                    Some("ps_script"),
+                ));
             }
             EventCategory::Wmi => {
-                categories.push("wmi_event");
+                aliases.push(LogSourceKey::from_parts(
+                    Some("windows"),
+                    Some("wmi"),
+                    Some("wmi_event"),
+                ));
             }
             EventCategory::Service => {
-                categories.push("service_creation");
+                aliases.push(LogSourceKey::from_parts(
+                    Some("windows"),
+                    Some("system"),
+                    Some("service_creation"),
+                ));
             }
             EventCategory::Task => {
-                categories.push("task_creation");
+                aliases.push(LogSourceKey::from_parts(
+                    Some("windows"),
+                    Some("taskscheduler"),
+                    Some("task_creation"),
+                ));
+                aliases.push(LogSourceKey::from_parts(
+                    Some("windows"),
+                    Some("task scheduler"),
+                    Some("task_creation"),
+                ));
             }
+        }
+
+        aliases
+    }
+
+    fn logsource_subsets(logsource: &LogSourceKey) -> Vec<LogSourceKey> {
+        let mut subsets = Vec::new();
+        let fields = [
+            logsource.product.as_deref(),
+            logsource.service.as_deref(),
+            logsource.category.as_deref(),
+        ];
+
+        for mask in [0b111, 0b110, 0b101, 0b011, 0b100, 0b010, 0b001] {
+            let product = if mask & 0b001 != 0 { fields[0] } else { None };
+            let service = if mask & 0b010 != 0 { fields[1] } else { None };
+            let category = if mask & 0b100 != 0 { fields[2] } else { None };
+
+            subsets.push(LogSourceKey::from_parts(product, service, category));
+        }
+
+        subsets
+    }
+
+    fn sigma_file_categories_for_event(event: &NormalizedEvent) -> Vec<&'static str> {
+        match event.event_id {
+            11 => vec!["file_event", "file_create"],
+            23 => vec!["file_delete"],
+            65 => vec!["file_event", "file_change"],
+            71 => vec!["file_event", "file_rename"],
+            _ => match event.opcode {
+                64 => vec!["file_event", "file_create"],
+                65 | 80 => vec!["file_event", "file_change"],
+                70 | 72 => vec!["file_delete"],
+                71 => vec!["file_event", "file_rename"],
+                _ => vec!["file_event"],
+            },
+        }
+    }
+
+    fn sigma_registry_categories_for_event(event: &NormalizedEvent) -> Vec<&'static str> {
+        let mut categories = vec!["registry_event"];
+
+        match event.opcode {
+            36 => categories.push("registry_add"),
+            39 => categories.push("registry_set"),
+            38 | 41 => categories.push("registry_delete"),
+            _ => {}
         }
 
         categories
@@ -2057,17 +2568,38 @@ impl Engine {
 
     /// Get statistics about loaded rules
     pub fn stats(&self) -> EngineStats {
+        let mut rules_by_category = HashMap::new();
+        for (logsource, rules) in &self.rules_by_logsource {
+            let category = logsource
+                .category
+                .clone()
+                .unwrap_or_else(|| "<none>".to_string());
+            *rules_by_category.entry(category).or_default() += rules.len();
+        }
+
         EngineStats {
             total_rules: self.rule_count,
-            rules_by_category: self
-                .rules_by_category
+            rules_by_category,
+            rules_by_logsource: self
+                .rules_by_logsource
                 .iter()
-                .map(|(k, v)| (k.clone(), v.len()))
+                .map(|(k, v)| (k.display(), v.len()))
+                .collect(),
+            deferred_logsource_rules: self
+                .deferred_logsource_counts
+                .iter()
+                .map(|(k, v)| (k.display(), *v))
+                .collect(),
+            unknown_logsource_rules: self
+                .unknown_logsource_counts
+                .iter()
+                .map(|(k, v)| (k.display(), *v))
                 .collect(),
             failed_rules: self.failed_rules.clone(),
             skipped_product_rules: self.skipped_product_rules,
-            skipped_service_rules: self.skipped_service_rules,
-            skipped_category_rules: self.skipped_category_rules,
+            skipped_deferred_rules: self.skipped_deferred_rules,
+            skipped_unknown_logsource_rules: self.skipped_unknown_logsource_rules,
+            inactive_collector_rules: self.inactive_collector_rules,
         }
     }
 }
@@ -2082,18 +2614,34 @@ impl Default for Engine {
 #[derive(Debug, Clone)]
 pub struct EngineStats {
     pub total_rules: usize,
+    #[allow(dead_code)] // Used by companion binaries outside the library crate.
     pub rules_by_category: HashMap<String, usize>,
+    pub rules_by_logsource: HashMap<String, usize>,
+    #[allow(dead_code)] // Used by companion binaries outside the library crate.
+    pub deferred_logsource_rules: HashMap<String, usize>,
+    #[allow(dead_code)] // Used by companion binaries outside the library crate.
+    pub unknown_logsource_rules: HashMap<String, usize>,
     #[allow(dead_code)] // Used by validation binaries outside this crate.
     pub failed_rules: Vec<(String, String)>,
     pub skipped_product_rules: usize,
-    pub skipped_service_rules: usize,
-    pub skipped_category_rules: usize,
+    pub skipped_deferred_rules: usize,
+    pub skipped_unknown_logsource_rules: usize,
+    pub inactive_collector_rules: usize,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::{EventFields, ProcessCreationFields};
+    use crate::sensor::Platform;
+
+    fn windows_engine() -> Engine {
+        Engine::new_for_platform(Platform::Windows)
+    }
+
+    fn linux_engine() -> Engine {
+        Engine::new_for_platform(Platform::Linux)
+    }
 
     #[test]
     fn test_engine_creation() {
@@ -2169,13 +2717,15 @@ detection:
 
         let mut engine = Engine::new();
         engine
-            .rules_by_category
-            .entry(compiled.category.clone())
+            .rules_by_logsource
+            .entry(compiled.logsource.clone())
             .or_default()
             .push(compiled);
 
         let mut event = NormalizedEvent {
             timestamp: "2025-01-01T00:00:00Z".to_string(),
+            platform: Platform::Windows,
+            provider: "etw".to_string(),
             category: EventCategory::Process,
             event_id: 1,
             event_id_string: "1".to_string(),
@@ -2229,13 +2779,15 @@ detection:
 
         let mut engine = Engine::new();
         engine
-            .rules_by_category
-            .entry(compiled.category.clone())
+            .rules_by_logsource
+            .entry(compiled.logsource.clone())
             .or_default()
             .push(compiled);
 
         let mut event = NormalizedEvent {
             timestamp: "2025-01-01T00:00:00Z".to_string(),
+            platform: Platform::Windows,
+            provider: "etw".to_string(),
             category: EventCategory::Process,
             event_id: 1,
             event_id_string: "1".to_string(),
@@ -2288,13 +2840,15 @@ detection:
 
         let mut engine = Engine::new();
         engine
-            .rules_by_category
-            .entry(compiled.category.clone())
+            .rules_by_logsource
+            .entry(compiled.logsource.clone())
             .or_default()
             .push(compiled);
 
         let mut event = NormalizedEvent {
             timestamp: "2025-01-01T00:00:00Z".to_string(),
+            platform: Platform::Windows,
+            provider: "etw".to_string(),
             category: EventCategory::Process,
             event_id: 1,
             event_id_string: "1".to_string(),
@@ -2359,6 +2913,8 @@ detection:
         // Create a mock normalized event for whoami.exe
         let event = NormalizedEvent {
             timestamp: "2025-01-01T00:00:00Z".to_string(),
+            platform: Platform::Windows,
+            provider: "etw".to_string(),
             category: EventCategory::Process,
             event_id: 1,
             event_id_string: "1".to_string(),
@@ -2564,6 +3120,8 @@ level: high
         use crate::models::*;
         let event = NormalizedEvent {
             timestamp: "2025-01-01T00:00:00Z".to_string(),
+            platform: Platform::Windows,
+            provider: "etw".to_string(),
             category: EventCategory::Process,
             event_id: 1,
             event_id_string: "1".to_string(),
@@ -2608,10 +3166,14 @@ detection:
 "#;
 
         let rule: SigmaRule = serde_yaml::from_str(rule_yaml).unwrap();
-        assert!(matches!(
-            Engine::skip_reason_for_rule(&rule),
-            Some(RuleSkipReason::Product)
-        ));
+        assert_eq!(
+            windows_engine().classify_logsource(&rule.logsource).status,
+            LogSourceStatus::ProductMismatch
+        );
+        assert_eq!(
+            linux_engine().classify_logsource(&rule.logsource).status,
+            LogSourceStatus::Supported
+        );
     }
 
     #[test]
@@ -2629,10 +3191,14 @@ detection:
 "#;
 
         let rule: SigmaRule = serde_yaml::from_str(rule_yaml).unwrap();
-        assert!(matches!(
-            Engine::skip_reason_for_rule(&rule),
-            Some(RuleSkipReason::Service)
-        ));
+        assert_eq!(
+            windows_engine().classify_logsource(&rule.logsource).status,
+            LogSourceStatus::Unknown
+        );
+        assert_eq!(
+            linux_engine().classify_logsource(&rule.logsource).status,
+            LogSourceStatus::ProductMismatch
+        );
     }
 
     #[test]
@@ -2649,10 +3215,257 @@ detection:
 "#;
 
         let rule: SigmaRule = serde_yaml::from_str(rule_yaml).unwrap();
-        assert!(matches!(
-            Engine::skip_reason_for_rule(&rule),
-            Some(RuleSkipReason::Category)
-        ));
+        assert_eq!(
+            windows_engine().classify_logsource(&rule.logsource).status,
+            LogSourceStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn test_linux_sysmon_process_rule_matches_full_logsource() {
+        let rule_yaml = r#"
+title: Linux Sysmon Process
+logsource:
+  product: linux
+  service: sysmon
+  category: process_creation
+detection:
+  selection:
+    Image: "*bash"
+  condition: selection
+"#;
+
+        let rule: SigmaRule = serde_yaml::from_str(rule_yaml).unwrap();
+        let mut engine = linux_engine();
+        let compiled = engine.compile_rule(rule).unwrap();
+        engine
+            .rules_by_logsource
+            .entry(compiled.logsource.clone())
+            .or_default()
+            .push(compiled);
+
+        let event = NormalizedEvent {
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            platform: Platform::Linux,
+            provider: "ebpf".to_string(),
+            category: EventCategory::Process,
+            event_id: 1,
+            event_id_string: "1".to_string(),
+            opcode: 1,
+            fields: EventFields::ProcessCreation(ProcessCreationFields {
+                image: Some("/usr/bin/bash".to_string()),
+                original_file_name: None,
+                product: None,
+                description: None,
+                target_image: None,
+                command_line: Some("/usr/bin/bash -c id".to_string()),
+                process_id: Some("42".to_string()),
+                parent_process_id: None,
+                parent_image: None,
+                parent_command_line: None,
+                current_directory: None,
+                integrity_level: None,
+                user: Some("alice".to_string()),
+                logon_id: None,
+                logon_guid: None,
+            }),
+            process_context: None,
+        };
+
+        assert!(engine.check_event(&event).is_some());
+    }
+
+    #[test]
+    fn test_linux_sysmon_service_only_rule_loads_without_category() {
+        let rule_yaml = r#"
+title: Linux Sysmon Any Category
+logsource:
+  product: linux
+  service: sysmon
+detection:
+  selection:
+    Image: "*bash"
+  condition: selection
+"#;
+
+        let rule: SigmaRule = serde_yaml::from_str(rule_yaml).unwrap();
+        let classification = linux_engine().classify_logsource(&rule.logsource);
+        assert_eq!(classification.status, LogSourceStatus::Supported);
+        assert_eq!(classification.collector_active, Some(true));
+    }
+
+    #[test]
+    fn test_generic_network_connection_rule_matches_linux_network_event() {
+        let rule_yaml = r#"
+title: Generic Network Connection
+logsource:
+  category: network
+  service: connection
+detection:
+  selection:
+    DestinationPort: "443"
+  condition: selection
+"#;
+
+        let rule: SigmaRule = serde_yaml::from_str(rule_yaml).unwrap();
+        let mut engine = linux_engine();
+        let compiled = engine.compile_rule(rule).unwrap();
+        engine
+            .rules_by_logsource
+            .entry(compiled.logsource.clone())
+            .or_default()
+            .push(compiled);
+
+        let event = NormalizedEvent {
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            platform: Platform::Linux,
+            provider: "ebpf".to_string(),
+            category: EventCategory::Network,
+            event_id: 3,
+            event_id_string: "3".to_string(),
+            opcode: 12,
+            fields: EventFields::NetworkConnection(crate::models::NetworkConnectionFields {
+                destination_ip: Some("198.51.100.10".to_string()),
+                source_ip: Some("10.0.0.5".to_string()),
+                destination_port: Some("443".to_string()),
+                source_port: Some("51234".to_string()),
+                process_id: Some("99".to_string()),
+                image: Some("/usr/bin/curl".to_string()),
+                user: Some("alice".to_string()),
+                destination_hostname: None,
+                protocol: Some("tcp".to_string()),
+            }),
+            process_context: None,
+        };
+
+        assert!(engine.check_event(&event).is_some());
+    }
+
+    #[test]
+    fn test_linux_file_rename_rule_matches_source_and_target_fields() {
+        let rule_yaml = r#"
+title: Linux File Rename
+logsource:
+  product: linux
+  category: file_rename
+detection:
+  selection:
+    SourceFilename|endswith: "/old.txt"
+    TargetFilename|endswith: "/new.txt"
+  condition: selection
+"#;
+
+        let rule: SigmaRule = serde_yaml::from_str(rule_yaml).unwrap();
+        let mut engine = linux_engine();
+        let compiled = engine.compile_rule(rule).unwrap();
+        engine
+            .rules_by_logsource
+            .entry(compiled.logsource.clone())
+            .or_default()
+            .push(compiled);
+
+        let event = NormalizedEvent {
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            platform: Platform::Linux,
+            provider: "ebpf".to_string(),
+            category: EventCategory::File,
+            event_id: 71,
+            event_id_string: "71".to_string(),
+            opcode: 71,
+            fields: EventFields::FileEvent(crate::models::FileEventFields {
+                source_filename: Some("/tmp/old.txt".to_string()),
+                target_filename: Some("/tmp/new.txt".to_string()),
+                process_id: Some("101".to_string()),
+                image: Some("/usr/bin/mv".to_string()),
+                creation_utc_time: None,
+                previous_creation_utc_time: None,
+                user: Some("alice".to_string()),
+            }),
+            process_context: None,
+        };
+
+        assert!(engine.check_event(&event).is_some());
+    }
+
+    #[test]
+    fn test_generic_dns_rule_matches_linux_dns_event_via_alias_fields() {
+        let rule_yaml = r#"
+title: Generic DNS Query
+logsource:
+  category: dns
+detection:
+  selection:
+    query: "example.com"
+    record_type: "A"
+  condition: selection
+"#;
+
+        let rule: SigmaRule = serde_yaml::from_str(rule_yaml).unwrap();
+        let mut engine = linux_engine();
+        let compiled = engine.compile_rule(rule).unwrap();
+        engine
+            .rules_by_logsource
+            .entry(compiled.logsource.clone())
+            .or_default()
+            .push(compiled);
+
+        let event = NormalizedEvent {
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            platform: Platform::Linux,
+            provider: "ebpf".to_string(),
+            category: EventCategory::Dns,
+            event_id: 22,
+            event_id_string: "22".to_string(),
+            opcode: 0,
+            fields: EventFields::DnsQuery(crate::models::DnsQueryFields {
+                query_name: Some("example.com".to_string()),
+                query_results: Some("1.1.1.1".to_string()),
+                record_type: Some("A".to_string()),
+                query_status: None,
+                process_id: Some("202".to_string()),
+                image: Some("/usr/bin/dig".to_string()),
+            }),
+            process_context: None,
+        };
+
+        assert!(engine.check_event(&event).is_some());
+    }
+
+    #[test]
+    fn test_linux_deferred_logsource_is_reported() {
+        let rule_yaml = r#"
+title: Deferred Auditd Rule
+logsource:
+  product: linux
+  service: auditd
+  category: process_creation
+detection:
+  selection:
+    exe: "/usr/bin/bash"
+  condition: selection
+"#;
+
+        let rule: SigmaRule = serde_yaml::from_str(rule_yaml).unwrap();
+        let classification = linux_engine().classify_logsource(&rule.logsource);
+        assert_eq!(classification.status, LogSourceStatus::Deferred);
+        assert_eq!(classification.collector_active, None);
+    }
+
+    #[test]
+    fn test_unsupported_modifier_rejected_explicitly() {
+        let rule_yaml = r#"
+title: Unsupported Modifier
+logsource:
+  category: process_creation
+detection:
+  selection:
+    Image|foobar: "*cmd.exe"
+  condition: selection
+"#;
+
+        let rule: SigmaRule = serde_yaml::from_str(rule_yaml).unwrap();
+        let error = windows_engine().compile_rule(rule).unwrap_err().to_string();
+        assert!(error.contains("Unsupported Sigma modifier"));
     }
 
     #[test]

@@ -9,7 +9,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, warn};
+use tracing::debug;
+
+#[cfg(windows)]
+use tracing::warn;
 
 #[cfg(windows)]
 use windows::core::PCWSTR;

@@ -1,166 +1,115 @@
 # Development
 
-## Building
+## Build Matrix
 
-### Requirements
+| Target | Tooling |
+| --- | --- |
+| Windows userspace build | Rust 1.92+, Visual Studio Build Tools |
+| Linux userspace build | Rust 1.92+ |
+| Linux eBPF object build | nightly Rust, `rust-src`, `bpf-linker` |
 
-- Rust 1.92 or later
-- Windows 10/11 or Server 2016+
-- Visual Studio Build Tools (for Windows API bindings)
+## Fastest Local Build Paths
 
-### Dev Run (Recommended)
+### Userspace
 
-Requires Administrator privileges for ETW access.
+```bash
+cargo check --workspace
+cargo build
+cargo build --release
+```
+
+On Windows, run the final binary from an elevated PowerShell. On Linux, run it as root or with the required eBPF capabilities.
+
+### Linux eBPF Build
+
+If `ebpf/rustinel-ebpf.o` already exists, a normal root `cargo build` embeds it and no nightly eBPF rebuild is needed.
+
+If you need to rebuild the eBPF object from source:
+
+```bash
+rustup toolchain install nightly
+rustup component add rust-src --toolchain nightly
+cargo install bpf-linker
+
+cd ebpf
+cargo +nightly build --release --bin rustinel-ebpf
+cp target/bpfel-unknown-none/release/rustinel-ebpf rustinel-ebpf.o
+cd ..
+```
+
+`build.rs` watches `ebpf/src`, `ebpf/Cargo.toml`, and `ebpf/rustinel-ebpf.o`. On Linux builds it embeds either the prebuilt object or a freshly compiled one.
+
+## Recommended Dev Runs
+
+### Windows
 
 ```powershell
 cargo run -- run --console
 ```
 
-### Quick Syntax Check
+### Linux
 
-```powershell
-cargo check
+```bash
+sudo cargo run -- run
 ```
 
-### Debug Build
+### Linux With eBPF Override
 
-```powershell
-cargo build
-```
+Useful when iterating on `ebpf/` without rebuilding the full userspace binary:
 
-### Release Build
-
-```powershell
-cargo build --release
-```
-
-Output: `target/release/rustinel.exe`
-
-## Project Structure
-
-```
-src/
-??? main.rs           # Entry point, CLI, service management
-??? lib.rs            # Library interface
-??? config.rs         # Configuration loading
-??? alerts.rs         # Alert output sink
-??? collector/        # ETW event collection
-??? engine/           # Sigma detection engine
-??? models/           # Data structures
-??? normalizer/       # Event normalization
-??? scanner/          # YARA scanning
-??? state/            # Caching layer
-??? utils/            # Helper functions
-??? bin/
-    ??? validate_rules.rs  # Rule validation tool
+```bash
+sudo env RUSTINEL_EBPF_OBJECT=$PWD/ebpf/rustinel-ebpf.o ./target/release/rustinel run
 ```
 
 ## Testing
 
-### Unit Tests
+### Unit and Integration Tests
 
-```powershell
+```bash
 cargo test
-```
-
-### Rule Validation
-
-Validate Sigma and YARA rules:
-
-```powershell
-cargo run --bin validate_rules
-```
-
-This tool:
-1. Loads and parses all Sigma rules
-2. Compiles all YARA rules
-3. Tests with synthetic events
-4. Reports validation statistics
-
-### Integration Tests
-
-```powershell
 cargo test --test integration
 ```
 
-## Code Style
+The placeholder integration test currently documents the Windows administrator requirement for ETW-backed testing.
 
-Format code before committing:
+## Code Quality
 
-```powershell
+```bash
 cargo fmt
-```
-
-Run linter:
-
-```powershell
 cargo clippy
 ```
 
-## Dependencies
+## Project Structure
 
-| Crate | Purpose |
-|-------|---------|
-| `ferrisetw` | ETW provider management |
-| `tokio` | Async runtime |
-| `yara-x` | YARA rule engine |
-| `regex` | Pattern matching |
-| `evalexpr` | Boolean expression evaluation |
-| `serde` | Serialization |
-| `tracing` | Structured logging |
-| `clap` | CLI parsing |
-| `windows` | Windows API bindings |
-| `windows-service` | Service management |
+```text
+src/
+├── main.rs             # CLI entry point and platform bootstrapping
+├── config.rs           # Config loading and defaults
+├── alerts.rs           # ECS NDJSON alert sink
+├── engine/             # Sigma rule parsing, classification, and evaluation
+├── ioc/                # Atomic IOC loading and matching
+├── models/             # Event, alert, and ECS data models
+├── normalizer/         # Shared event normalization and enrichment
+├── reload/             # Hot reload poller and worker
+├── response/           # Optional process termination logic
+├── scanner/            # YARA compilation and scanning
+├── sensor/
+│   ├── windows/        # ETW sensor implementation
+│   └── linux/          # eBPF userspace loader and event decoding
+├── state/              # Process, DNS, SID, and network aggregation state
+└── utils/              # Platform-specific helpers
 
-## Adding Features
-
-### New ETW Provider
-
-1. Add provider GUID in `collector/mod.rs`
-2. Create event handler in `engine/handler.rs`
-3. Add normalization logic in `normalizer/mod.rs`
-4. Update event category in `models/mod.rs`
-
-### New Sigma Modifier
-
-1. Add parsing in `engine/mod.rs`
-2. Implement matching logic
-3. Add tests
-
-### New YARA Integration
-
-1. Extend `scanner/mod.rs`
-2. Add trigger conditions
-3. Update alert generation
-
-## Debugging
-
-### Logging Contract
-
-Use this contract consistently when adding/changing logs:
-
-- `trace`: high-frequency internals (per-event/per-rule/per-field diagnostics).
-- `debug`: actionable troubleshooting (queue drops, retryable worker errors, parse failures worth investigating).
-- `info`: lifecycle + health summaries + positive detections.
-- `warn`/`error`: degraded behavior, failures, or reliability risk.
-
-If a line can fire on most events in normal operation, it belongs in `trace`, not `debug`.
-
-### Verbose Logging
-
-```powershell
-$env:EDR__LOGGING__LEVEL="trace"
-rustinel run --console
+ebpf/
+└── src/                # Linux eBPF programs and event ABI definitions
 ```
 
-### ETW Tracing
+## Logging Guidance
 
-Use Windows Performance Analyzer or logman to trace ETW sessions:
+Use the existing logging contract when adding runtime logs:
 
-```powershell
-logman query -ets
-```
+- `trace`: high-volume internals
+- `debug`: troubleshooting detail
+- `info`: lifecycle and positive detections
+- `warn` and `error`: degraded behavior or failures
 
-## License
-
-Apache 2.0
+If a line can fire on most normal events, it does not belong at `debug`.

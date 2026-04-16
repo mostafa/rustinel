@@ -1,79 +1,74 @@
-//! Sigma detection event handler
-//!
-//! Implements the EventHandler trait to process ETW events
-//! through the Sigma detection engine.
+//! Sigma detection event handler.
 
-use crate::alerts::AlertSink;
-use crate::collector::EventHandler;
-use crate::models::EventCategory;
-use crate::normalizer::Normalizer;
-use crate::reload::DetectorStore;
-use crate::response::ResponseEngine;
-use ferrisetw::EventRecord;
 use std::sync::Arc;
+
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
-/// Target name for engine operational logs
+use crate::alerts::AlertSink;
+use crate::normalizer::Normalizer;
+use crate::reload::DetectorStore;
+use crate::response::ResponseEngine;
+use crate::sensor::{SensorAction, SensorEvent, SensorEventHandler};
+
+/// Target name for engine operational logs.
 const TARGET_ENGINE: &str = "engine";
 
-/// Sigma detection handler that normalizes events and checks them against Sigma rules
+/// Sigma detection handler that normalizes events and checks them against Sigma rules.
 pub struct SigmaDetectionHandler {
-    /// Normalizer for converting ETW events to Sysmon-compatible format
+    /// Normalizer for converting sensor events to the normalized event model.
     pub normalizer: Arc<Normalizer>,
-    /// Live detector store (sigma/ioc hot-reloaded atomically)
+    /// Live detector store (sigma/ioc hot-reloaded atomically).
     pub detectors: Arc<DetectorStore>,
-    /// Hash worker channel (optional)
+    /// Hash worker channel (optional).
     pub ioc_hash_tx: Option<mpsc::Sender<(String, u32)>>,
-    /// ECS NDJSON alert sink
+    /// ECS NDJSON alert sink.
     pub alert_sink: AlertSink,
-    /// Active response engine
+    /// Active response engine.
     pub response_engine: ResponseEngine,
 }
 
-impl EventHandler for SigmaDetectionHandler {
-    fn handle_event(&self, record: &EventRecord, category: EventCategory) {
-        // Trace-level event receipt log for deep pipeline diagnostics.
+impl SensorEventHandler for SigmaDetectionHandler {
+    fn handle_event(&self, event: &SensorEvent) {
         tracing::trace!(
             target: TARGET_ENGINE,
-            category = ?category,
-            provider = ?record.provider_id(),
-            event_id = record.event_id(),
-            opcode = record.opcode(),
+            category = ?event.category(),
+            provider = event.provider,
+            action = ?event.action,
+            pid = event.pid,
             "Event received"
         );
 
-        // Normalize the event
-        match self.normalizer.normalize(record, category) {
+        match self.normalizer.normalize(event) {
             Some(normalized_event) => {
                 tracing::trace!(target: TARGET_ENGINE, "Event normalized successfully");
 
-                // Trace normalized event only when trace logging is enabled.
                 if tracing::enabled!(tracing::Level::TRACE) {
                     if let Ok(json) = serde_json::to_string(&normalized_event) {
                         tracing::trace!(target: TARGET_ENGINE, normalized_json = %json, "Normalized event");
                     }
                 }
 
-                // Queue hash checks on process start (non-blocking)
                 if let Some(tx) = &self.ioc_hash_tx {
-                    if normalized_event.category == EventCategory::Process
-                        && normalized_event.opcode == 1
+                    if event.category() == crate::models::EventCategory::Process
+                        && event.action == SensorAction::Start
                     {
-                        if let crate::models::EventFields::ProcessCreation(f) =
+                        if let crate::models::EventFields::ProcessCreation(fields) =
                             &normalized_event.fields
                         {
-                            if let Some(image) = &f.image {
-                                let pid = f
+                            if let Some(image) = fields.image.as_deref() {
+                                let pid = fields
                                     .process_id
                                     .as_deref()
                                     .and_then(|value| value.parse::<u32>().ok())
-                                    .unwrap_or_else(|| record.process_id());
-                                if let Err(err) = tx.try_send((image.clone(), pid)) {
+                                    .or(event.pid)
+                                    .unwrap_or(0);
+
+                                if let Err(err) = tx.try_send((image.to_string(), pid)) {
                                     debug!(
                                         target: TARGET_ENGINE,
                                         pid = pid,
-                                        image = %image,
+                                        image = image,
                                         error = %err,
                                         "IOC hash queue full; dropping job"
                                     );
@@ -83,13 +78,11 @@ impl EventHandler for SigmaDetectionHandler {
                     }
                 }
 
-                // Check against Sigma rules (live engine snapshot)
                 let sigma = self.detectors.sigma();
                 if let Some(mut alert) = sigma.check_event(&normalized_event) {
                     self.normalizer
-                        .enrich_process_context(&mut alert.event, record.process_id());
+                        .enrich_process_context(&mut alert.event, event.pid.unwrap_or(0));
 
-                    // 1. Operational Log (Text) - For debugging and monitoring
                     info!(
                         target: TARGET_ENGINE,
                         rule = %alert.rule_name,
@@ -98,24 +91,20 @@ impl EventHandler for SigmaDetectionHandler {
                         "Sigma detection triggered"
                     );
 
-                    // 2. Security Alert (ECS NDJSON) - For SIEM ingestion
                     self.alert_sink.write_alert(&alert);
-
-                    // 3. Active Response (optional)
                     self.response_engine.handle_alert(&alert);
                 } else {
-                    // No match - moved to TRACE level (most verbose)
                     tracing::trace!(target: TARGET_ENGINE, "No Sigma rule matched this event");
                 }
 
-                // Check against IOC rules (live engine snapshot)
                 let ioc_engine = self.detectors.ioc();
                 let ioc_matches = ioc_engine.check_event(&normalized_event);
                 if !ioc_matches.is_empty() {
-                    for m in ioc_matches {
-                        let mut alert = ioc_engine.build_alert_for_match(&m, &normalized_event);
+                    for ioc_match in ioc_matches {
+                        let mut alert =
+                            ioc_engine.build_alert_for_match(&ioc_match, &normalized_event);
                         self.normalizer
-                            .enrich_process_context(&mut alert.event, record.process_id());
+                            .enrich_process_context(&mut alert.event, event.pid.unwrap_or(0));
                         info!(
                             target: TARGET_ENGINE,
                             rule = %alert.rule_name,
@@ -129,7 +118,9 @@ impl EventHandler for SigmaDetectionHandler {
                 }
             }
             None => {
-                if category == EventCategory::Process && record.opcode() == 2 {
+                if event.category() == crate::models::EventCategory::Process
+                    && event.action == SensorAction::Stop
+                {
                     tracing::trace!(
                         target: TARGET_ENGINE,
                         "Process stop event processed for cache maintenance"
@@ -137,12 +128,11 @@ impl EventHandler for SigmaDetectionHandler {
                     return;
                 }
 
-                // Failed normalization - only log in debug mode
                 debug!(
                     target: TARGET_ENGINE,
-                    category = ?category,
-                    event_id = record.event_id(),
-                    opcode = record.opcode(),
+                    category = ?event.category(),
+                    action = ?event.action,
+                    pid = event.pid,
                     "Failed to normalize event"
                 );
             }

@@ -15,6 +15,34 @@ use std::path::PathBuf;
 
 use crate::models::MatchDebugLevel;
 
+/// Default trusted paths for the allowlist, chosen per platform.
+/// These prevent YARA, IOC hash scanning, and active response from acting
+/// on binaries shipped with the OS.
+fn default_allowlist_paths() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        vec![
+            "C:\\Windows\\".to_string(),
+            "C:\\Program Files\\".to_string(),
+            "C:\\Program Files (x86)\\".to_string(),
+        ]
+    }
+    #[cfg(not(windows))]
+    {
+        vec![
+            "/usr/bin/".to_string(),
+            "/usr/sbin/".to_string(),
+            "/usr/lib/".to_string(),
+            "/usr/lib64/".to_string(),   // RHEL/Fedora/CentOS
+            "/usr/libexec/".to_string(), // system helper executables
+            "/bin/".to_string(),
+            "/sbin/".to_string(),
+            "/lib/".to_string(),
+            "/lib64/".to_string(),
+        ]
+    }
+}
+
 /// Main application configuration
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
@@ -126,15 +154,10 @@ impl AppConfig {
             .set_default("alerts.directory", "logs")?
             .set_default("alerts.filename", "alerts.json")?
             .set_default("alerts.match_debug", "off")?
-            // Global allowlist
-            .set_default(
-                "allowlist.paths",
-                vec![
-                    "C:\\Windows\\".to_string(),
-                    "C:\\Program Files\\".to_string(),
-                    "C:\\Program Files (x86)\\".to_string(),
-                ],
-            )?
+            // Global allowlist — platform-specific trusted paths.
+            // These are the default values only; override via config.toml or
+            // EDR__ALLOWLIST__PATHS environment variable.
+            .set_default("allowlist.paths", default_allowlist_paths())?
             // Active Response
             .set_default("response.enabled", false)?
             .set_default("response.prevention_enabled", false)?
@@ -206,11 +229,7 @@ impl Default for AppConfig {
                 match_debug: MatchDebugLevel::Off,
             },
             allowlist: AllowlistConfig {
-                paths: vec![
-                    "C:\\Windows\\".to_string(),
-                    "C:\\Program Files\\".to_string(),
-                    "C:\\Program Files (x86)\\".to_string(),
-                ],
+                paths: default_allowlist_paths(),
             },
             response: ResponseConfig {
                 enabled: false,
