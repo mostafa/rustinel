@@ -47,7 +47,7 @@ impl Normalizer {
     /// Normalize a shared sensor event to Sigma-compatible format.
     pub fn normalize(&self, event: &SensorEvent) -> Option<NormalizedEvent> {
         let fields = match &event.payload {
-            SensorPayload::Process(fields) => self.normalize_process(event, fields.clone()),
+            SensorPayload::Process(fields) => self.normalize_process(event, fields),
             SensorPayload::Network(fields) => self.normalize_network(event, fields.clone()),
             SensorPayload::File(fields) => self.normalize_file(event, fields.clone()),
             SensorPayload::Dns(fields) => self.normalize_dns(event, fields.clone()),
@@ -75,83 +75,82 @@ impl Normalizer {
     fn normalize_process(
         &self,
         event: &SensorEvent,
-        mut fields: ProcessCreationFields,
+        fields: &ProcessCreationFields,
     ) -> Option<EventFields> {
+        let pid = event_pid(event, fields.process_id.as_deref());
+
+        if event.action == SensorAction::Stop {
+            let creation_time = event
+                .process_start_key
+                .map(|key| key.start_time)
+                .or_else(|| {
+                    if pid == 0 {
+                        None
+                    } else {
+                        self.process_cache.get_latest_creation_time(pid)
+                    }
+                });
+
+            if let Some(creation_time) = creation_time {
+                self.process_cache.remove(pid, creation_time);
+            }
+            return None;
+        }
+
+        let mut fields = fields.clone();
         self.resolve_user_field(&mut fields.user);
 
-        let pid = event_pid(event, fields.process_id.as_deref());
         if event.action == SensorAction::Start && fields.command_line.is_none() && pid != 0 {
             if let Some(command_line) = query_process_command_line(pid) {
                 fields.command_line = Some(command_line);
             }
         }
 
-        match event.action {
-            SensorAction::Start => {
-                if let Some(image) = fields.image.clone() {
-                    let parent_pid = parse_optional_u32(fields.parent_process_id.as_deref());
-                    let (parent_image, parent_command_line) = if let Some(parent_pid) = parent_pid {
-                        if let Some(parent_meta) = self.process_cache.get_metadata(parent_pid) {
-                            (Some(parent_meta.image_name), parent_meta.command_line)
-                        } else {
-                            (None, None)
-                        }
+        if event.action == SensorAction::Start {
+            if let Some(image) = fields.image.clone() {
+                let parent_pid = parse_optional_u32(fields.parent_process_id.as_deref());
+                let (parent_image, parent_command_line) = if let Some(parent_pid) = parent_pid {
+                    if let Some(parent_meta) = self.process_cache.get_metadata(parent_pid) {
+                        (Some(parent_meta.image_name), parent_meta.command_line)
                     } else {
                         (None, None)
-                    };
-
-                    if fields.parent_image.is_none() {
-                        fields.parent_image = parent_image;
                     }
-                    if fields.parent_command_line.is_none() {
-                        fields.parent_command_line = parent_command_line;
-                    }
+                } else {
+                    (None, None)
+                };
 
-                    if pid != 0 {
-                        let start_time = event
-                            .process_start_key
-                            .map(|key| key.start_time)
-                            .unwrap_or_else(|| process_cache_time_fallback(event.timestamp));
-
-                        self.process_cache.add(
-                            pid,
-                            start_time,
-                            image,
-                            fields.command_line.clone(),
-                            fields.user.clone(),
-                            parent_pid,
-                            fields.parent_image.clone(),
-                            fields.parent_command_line.clone(),
-                            fields.original_file_name.clone(),
-                            fields.product.clone(),
-                            fields.description.clone(),
-                            fields.current_directory.clone(),
-                            fields.integrity_level.clone(),
-                            fields.logon_id.clone(),
-                            fields.logon_guid.clone(),
-                        );
-                    }
+                if fields.parent_image.is_none() {
+                    fields.parent_image = parent_image;
                 }
-            }
-            SensorAction::Stop => {
-                let creation_time =
-                    event
+                if fields.parent_command_line.is_none() {
+                    fields.parent_command_line = parent_command_line;
+                }
+
+                if pid != 0 {
+                    let start_time = event
                         .process_start_key
                         .map(|key| key.start_time)
-                        .or_else(|| {
-                            if pid == 0 {
-                                None
-                            } else {
-                                self.process_cache.get_latest_creation_time(pid)
-                            }
-                        });
+                        .unwrap_or_else(|| process_cache_time_fallback(event.timestamp));
 
-                if let Some(creation_time) = creation_time {
-                    self.process_cache.remove(pid, creation_time);
+                    self.process_cache.add(
+                        pid,
+                        start_time,
+                        image,
+                        fields.command_line.clone(),
+                        fields.user.clone(),
+                        parent_pid,
+                        fields.parent_image.clone(),
+                        fields.parent_command_line.clone(),
+                        fields.original_file_name.clone(),
+                        fields.product.clone(),
+                        fields.description.clone(),
+                        fields.current_directory.clone(),
+                        fields.integrity_level.clone(),
+                        fields.logon_id.clone(),
+                        fields.logon_guid.clone(),
+                    );
                 }
-                return None;
             }
-            _ => {}
         }
 
         Some(EventFields::ProcessCreation(fields))
