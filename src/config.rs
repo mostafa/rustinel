@@ -64,6 +64,14 @@ pub struct ScannerConfig {
     pub yara_enabled: bool,
     pub yara_rules_path: PathBuf,
     pub yara_allowlist_paths: Vec<String>,
+    pub yara_memory_enabled: bool,
+    pub yara_memory_queue_capacity: usize,
+    pub yara_memory_delay_ms: u64,
+    pub yara_memory_max_process_mb: u64,
+    pub yara_memory_max_region_mb: u64,
+    pub yara_memory_include_private: bool,
+    pub yara_memory_include_image: bool,
+    pub yara_memory_include_mapped: bool,
 }
 
 /// Global allowlist configuration shared across modules
@@ -145,6 +153,14 @@ impl AppConfig {
             .set_default("scanner.yara_enabled", true)?
             .set_default("scanner.yara_rules_path", "rules/yara")?
             .set_default("scanner.yara_allowlist_paths", Vec::<String>::new())?
+            .set_default("scanner.yara_memory_enabled", false)?
+            .set_default("scanner.yara_memory_queue_capacity", 64i64)?
+            .set_default("scanner.yara_memory_delay_ms", 750i64)?
+            .set_default("scanner.yara_memory_max_process_mb", 64i64)?
+            .set_default("scanner.yara_memory_max_region_mb", 8i64)?
+            .set_default("scanner.yara_memory_include_private", true)?
+            .set_default("scanner.yara_memory_include_image", false)?
+            .set_default("scanner.yara_memory_include_mapped", false)?
             // Logging
             .set_default("logging.level", "info")?
             .set_default("logging.directory", "logs")?
@@ -215,6 +231,14 @@ impl Default for AppConfig {
                 yara_enabled: true,
                 yara_rules_path: PathBuf::from("rules/yara"),
                 yara_allowlist_paths: Vec::new(),
+                yara_memory_enabled: false,
+                yara_memory_queue_capacity: 64,
+                yara_memory_delay_ms: 750,
+                yara_memory_max_process_mb: 64,
+                yara_memory_max_region_mb: 8,
+                yara_memory_include_private: true,
+                yara_memory_include_image: false,
+                yara_memory_include_mapped: false,
             },
             logging: LogConfig {
                 level: "info".to_string(),
@@ -305,6 +329,19 @@ mod tests {
         assert_eq!(cfg.response.allowlist_paths, cfg.allowlist.paths);
         assert_eq!(cfg.ioc.hash_allowlist_paths, cfg.allowlist.paths);
         assert_eq!(cfg.scanner.yara_allowlist_paths, cfg.allowlist.paths);
+    }
+
+    #[test]
+    fn test_yara_memory_defaults_disabled() {
+        let cfg = AppConfig::default();
+        assert!(!cfg.scanner.yara_memory_enabled);
+        assert_eq!(cfg.scanner.yara_memory_queue_capacity, 64);
+        assert_eq!(cfg.scanner.yara_memory_max_process_mb, 64);
+        assert_eq!(cfg.scanner.yara_memory_max_region_mb, 8);
+        assert_eq!(cfg.scanner.yara_memory_delay_ms, 750);
+        assert!(cfg.scanner.yara_memory_include_private);
+        assert!(!cfg.scanner.yara_memory_include_image);
+        assert!(!cfg.scanner.yara_memory_include_mapped);
     }
 
     #[test]

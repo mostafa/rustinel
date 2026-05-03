@@ -138,6 +138,18 @@ YARA scanning is shared across both supported platforms.
 
 Every YARA match is emitted as a `critical` alert.
 
+### YARA memory scanning
+
+YARA memory scanning is optional and disabled by default (`scanner.yara_memory_enabled = false`).
+
+When enabled, Rustinel queues process IDs from process-start events to a bounded background worker. The worker waits a configurable delay (`yara_memory_delay_ms`, default 750 ms) to allow packers or loaders to finish unpacking, then reads a limited amount of selected process memory and scans it with the active YARA ruleset.
+
+Default behavior scans private readable memory only and avoids mapped or image-backed regions to reduce overhead and false positives. Each matching YARA rule emits its own `critical` alert. The alert `provider` field is set to `yara-memory` to distinguish memory hits from file hits (`etw` or `ebpf`).
+
+Memory scanning follows the same allowlist as file YARA: process paths allowlisted via `scanner.yara_allowlist_paths` are not queued for memory scanning either.
+
+The worker uses `try_send` so a full queue drops jobs rather than blocking the sensor event path.
+
 ## IOC
 
 The IOC engine hot reloads indicator files and splits work between inline event checks and a background hash worker.
