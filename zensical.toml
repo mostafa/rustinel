@@ -17,17 +17,17 @@ site_name = "Rustinel"
 # meaningful description of the site content for use by search engines.
 #
 # Read more: https://zensical.org/docs/setup/basics/#site_description
-site_description = "Open-source endpoint detection and response for Windows ETW and Linux eBPF, built in Rust"
+site_description = "Open-source endpoint detection for Windows and Linux using ETW, eBPF, Sigma, YARA, IOCs, and Rust"
 
 # The site_author attribute. This is used in the HTML head element.
 #
 # Read more: https://zensical.org/docs/setup/basics/#site_author
-site_author = "The Rustinel Authors"
+site_author = "The Rustinel Project"
 
 # The site_url is the canonical URL for your site. When building online
 # documentation you should set this.
 # Read more: https://zensical.org/docs/setup/basics/#site_url
-site_url = "https://Karib0u.github.io/rustinel/"
+site_url = "https://karib0u.github.io/rustinel/"
 
 # The repo_url is the URL of your project's repository.
 repo_url = "https://github.com/Karib0u/rustinel"
@@ -185,7 +185,7 @@ features = [
 
     # TODO: not sure I understand this one? Is there a demo of this in the docs?
     # https://zensical.org/docs/authoring/tooltips/#improved-tooltips
-    "content.tooltips",
+    # "content.tooltips",
 
     # With this feature enabled, Zensical will automatically hide parts
     # of the header when the user scrolls past a certain point.
@@ -221,7 +221,7 @@ features = [
     # In order to provide a better user experience on slow connections when
     # using instant navigation, a progress indicator can be enabled.
     # https://zensical.org/docs/setup/navigation/#progress-indicator
-    #"navigation.instant.progress",
+    "navigation.instant.progress",
 
     # When navigation paths are activated, a breadcrumb navigation is rendered
     # above the title of each page
@@ -267,7 +267,7 @@ features = [
     # When anchor following for the table of contents is enabled, the sidebar
     # is automatically scrolled so that the active anchor is always visible.
     # https://zensical.org/docs/setup/navigation/#anchor-following
-    # "toc.follow",
+    "toc.follow",
 
     # When navigation integration for the table of contents is enabled, it is
     # always rendered as part of the navigation sidebar on the left.
