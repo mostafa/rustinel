@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/images/logo-rustinel.png" alt="Rustinel logo" width="280">
+</p>
+
 # Rustinel
 
 **Open-source endpoint detection for Windows and Linux**

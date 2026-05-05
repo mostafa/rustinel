@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="images/logo-rustinel.png" alt="Rustinel logo" width="280">
+</p>
+
 # Rustinel Documentation
 
 **Rustinel** is an open-source endpoint detection project for Windows and Linux.
