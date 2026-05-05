@@ -1,39 +1,91 @@
 # Roadmap
 
-Rustinel is in active development. The items below reflect planned improvements across the sensor, detection, and operational layers.
+This roadmap describes planned areas of work.
 
-## Sensor
-
-### Linux
-
-- **DNS domain name extraction** — `QueryName` is currently absent from Linux DNS events because BPF verifier complexity prevents in-kernel string parsing of DNS payloads. The plan is to move extraction to a userspace eBPF ring-buffer consumer or a `perf_event` uprobe on resolver libraries.
-- **Expanded file telemetry** — cover `chmod`, `chown`, `truncate`, and `link` syscalls to close gaps in file-integrity coverage.
-- **Container context** — enrich process events with cgroup, namespace, and container runtime metadata so rules can scope to specific workloads.
-
-### Windows
-
-- **ETW integrity checks** — detect ETW session tampering and provider blinding that could suppress telemetry.
-- **Deep inspection via stack walking** — identify shellcode and "floating code" executing outside mapped image regions.
-
-### Cross-Platform
-
-- **Memory scanning** — extend YARA to scan live process memory regions on creation, not just the on-disk executable.
-- **Periodic YARA sweeps** — scheduled background scans of running processes independent of creation events.
+It is not a strict release commitment.
 
 ## Detection
 
-- **Sigma aggregation conditions** — support `count`, `min`, `max`, `avg`, and `sum` aggregations for threshold and frequency-based rules.
-- **Correlation engine** — multi-event rules that fire when a sequence or pattern of events occurs within a time window.
-- **Threat intelligence enrichment** — inline lookup against external feeds at alert time.
+### YARA memory scanning
+
+YARA memory scanning is planned to improve detection of:
+
+- Packed payloads
+- Obfuscated payloads
+- Runtime-unpacked malware
+- Payloads that are more visible in memory than on disk
+
+This is intended to complement process creation scanning and behavioral detection.
+
+### More Sigma examples
+
+More example Sigma rules are planned for common detection scenarios, including:
+
+- Suspicious PowerShell
+- WMI abuse
+- Service creation
+- Scheduled task creation
+- Suspicious Linux process execution
+- Suspicious network activity
+
+### Better IOC examples
+
+More IOC examples are planned for:
+
+- Hash matching
+- Domain matching
+- IP matching
+- Path regex matching
+
+## Telemetry
+
+### Expanded Linux eBPF coverage
+
+Linux support currently focuses on process, network, file, and DNS telemetry.
+
+Future work may expand Linux coverage depending on stability, portability, and usefulness.
+
+### Better normalization documentation
+
+More documentation is planned around how raw ETW and eBPF events are normalized into Rustinel’s shared event model.
 
 ## Operations
 
-- **Resource governor** — CPU and memory budgets via Windows Job Objects and Linux cgroups to prevent the agent from affecting monitored workloads.
-- **Watchdog sidecar** — lightweight companion process that restarts the agent if it crashes or becomes unresponsive.
-- **Metrics endpoint** — expose operational counters (events processed, rules evaluated, alerts generated, queue depth) for Prometheus or a compatible scraper.
-- **Remote rule delivery** — pull rule and IOC updates from a central server without manual file deployment.
+### SIEM integration examples
 
-## Hardening
+Rustinel writes ECS NDJSON alerts.
 
-- **Self-defense** — restrict access to the agent process and its rule files via Windows DACL restrictions and Linux seccomp/namespace isolation to reduce tampering surface.
-- **eBPF program integrity** — verify that loaded eBPF objects match expected checksums at startup.
+Future documentation should include examples for ingesting those alerts into common SIEM and log platforms.
+
+### Deployment examples
+
+More deployment examples are planned for:
+
+- Windows service mode
+- Linux supervisor-based deployment
+- Lab environments
+- Detection engineering environments
+
+### Hardening guidance
+
+Optional hardening guidance is planned for users who want to make Rustinel harder to stop or identify.
+
+This may include recommendations around:
+
+- Installation paths
+- Service names
+- File permissions
+- Logging locations
+- Operational monitoring
+
+## Community
+
+Useful community contributions include:
+
+- Testing on different Windows and Linux versions
+- Reporting telemetry gaps
+- Improving documentation
+- Adding Sigma examples
+- Adding YARA examples
+- Adding safe demo scenarios
+- Testing SIEM ingestion
