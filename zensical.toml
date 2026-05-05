@@ -49,16 +49,31 @@ Copyright &copy; 2026 The Rustinel Authors
 # Read more: https://zensical.org/docs/setup/navigation/
 nav = [
     { "Home" = "index.md" },
-    { "Getting Started" = "getting-started.md" },
-    { "Operations" = "operations.md" },
-    { "Configuration" = "configuration.md" },
-    { "CLI" = "cli.md" },
-    { "Architecture" = "architecture.md" },
-    { "Detection" = "detection.md" },
-    { "Active Response" = "active-response.md" },
-    { "Output" = "output.md" },
-    { "Development" = "development.md" },
-    { "Roadmap" = "roadmap.md" },
+
+    { "Start Here" = [
+        { "Getting Started" = "getting-started.md" },
+        { "Troubleshooting" = "troubleshooting.md" },
+    ] },
+
+    { "Using Rustinel" = [
+        { "Configuration" = "configuration.md" },
+        { "CLI" = "cli.md" },
+        { "Operations" = "operations.md" },
+        { "Active Response" = "active-response.md" },
+        { "Output" = "output.md" },
+    ] },
+
+    { "How It Works" = [
+        { "Architecture" = "architecture.md" },
+        { "Detection" = "detection.md" },
+        { "Limitations" = "limitations.md" },
+    ] },
+
+    { "Project" = [
+        { "Why Rustinel" = "why-rustinel.md" },
+        { "Roadmap" = "roadmap.md" },
+        { "Development" = "development.md" },
+    ] },
 ]
 
 # With the "extra_css" option you can add your own CSS styling to customize
