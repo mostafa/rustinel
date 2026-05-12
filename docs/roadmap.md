@@ -4,6 +4,23 @@ This roadmap describes planned areas of work.
 
 It is not a strict release commitment.
 
+## Sensor
+
+### Linux
+
+- **DNS domain name extraction** — `QueryName` is currently absent from Linux DNS events because BPF verifier complexity prevents in-kernel string parsing of DNS payloads. The plan is to move extraction to a userspace eBPF ring-buffer consumer or a `perf_event` uprobe on resolver libraries.
+- **Expanded file telemetry** — cover `chmod`, `chown`, `truncate`, and `link` syscalls to close gaps in file-integrity coverage.
+- **Container context** — enrich process events with cgroup, namespace, and container runtime metadata so rules can scope to specific workloads.
+
+### Windows
+
+- **ETW integrity checks** — detect ETW session tampering and provider blinding that could suppress telemetry.
+- **Deep inspection via stack walking** — identify shellcode and "floating code" executing outside mapped image regions.
+
+### Cross-Platform
+
+- **Periodic YARA sweeps** — scheduled background scans of running processes independent of creation events.
+
 ## Detection
 
 ### YARA memory scanning

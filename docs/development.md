@@ -66,11 +66,23 @@ sudo env RUSTINEL_EBPF_OBJECT=$PWD/ebpf/rustinel-ebpf.o ./target/release/rustine
 ### Unit and Integration Tests
 
 ```bash
-cargo test
-cargo test --test integration
+cargo test --locked
+cargo test --locked --test pipeline_sigma
+cargo test --locked --test yara_disk
+cargo test --locked --test yara_memory
 ```
 
-The placeholder integration test currently documents the Windows administrator requirement for ETW-backed testing.
+Cargo auto-discovers the integration tests in `tests/*.rs`. The normal suite uses synthetic events and temporary Sigma, YARA, and IOC fixtures, so it does not require administrator/root privileges.
+
+Ignored smoke tests cover live process memory scanning and active-response termination. Build the test target first, then opt in explicitly:
+
+```bash
+cargo build --locked --example memory_target
+cargo test --locked --test yara_memory -- --include-ignored
+cargo test --locked --test active_response -- --include-ignored
+```
+
+Those ignored tests may require administrator rights on Windows or a controlled Linux host with permissive process-memory access.
 
 ## Code Quality
 

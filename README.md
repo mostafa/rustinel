@@ -319,6 +319,7 @@ The roadmap describes planned areas of work, not strict release commitments.
 - [Configuration](https://karib0u.github.io/rustinel/configuration/)
 - [Detection](https://karib0u.github.io/rustinel/detection/)
 - [Architecture](https://karib0u.github.io/rustinel/architecture/)
+- [Development](https://karib0u.github.io/rustinel/development/)
 - [Operations and Upgrade Guide](https://karib0u.github.io/rustinel/operations/)
 - [Troubleshooting](https://karib0u.github.io/rustinel/troubleshooting/)
 - [FAQ](https://karib0u.github.io/rustinel/faq/)

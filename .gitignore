@@ -34,7 +34,8 @@ ebpf/rustinel-ebpf.o
 ebpf/Cargo.lock
 
 tests/**/*
-!tests/integration.rs
+!tests/**/
+!tests/**/*.rs
 
 *.exe
 *.pdb

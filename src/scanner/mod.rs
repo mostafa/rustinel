@@ -80,6 +80,7 @@ struct YaraFileIdentity {
     path: String,
     size: u64,
     mtime_nanos: u128,
+    match_debug: MatchDebugLevel,
 }
 
 #[derive(Debug, Clone)]
@@ -160,7 +161,7 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-fn yara_file_identity(path: &str) -> Option<YaraFileIdentity> {
+fn yara_file_identity(path: &str, match_debug: MatchDebugLevel) -> Option<YaraFileIdentity> {
     let metadata = fs::metadata(path).ok()?;
     let size = metadata.len();
     let mtime_nanos = metadata
@@ -174,6 +175,7 @@ fn yara_file_identity(path: &str) -> Option<YaraFileIdentity> {
         path: normalize_path_for_allowlist(path),
         size,
         mtime_nanos,
+        match_debug,
     })
 }
 
@@ -278,7 +280,7 @@ impl Scanner {
     ) -> Result<Vec<YaraRuleMatch>> {
         let path = normalize_yara_path(path);
         let path = path.as_str();
-        let identity = yara_file_identity(path);
+        let identity = yara_file_identity(path, match_debug);
         if let Some(identity) = identity.as_ref() {
             if let Ok(mut cache) = self.cache.lock() {
                 if let Some(cached_matches) = cache.get(identity) {
@@ -565,6 +567,7 @@ mod tests {
             path: r"c:\temp\sample.exe".to_string(),
             size: 1337,
             mtime_nanos: 42,
+            match_debug: MatchDebugLevel::Off,
         };
         let expected = vec![YaraRuleMatch {
             rule: "TestRule".to_string(),
@@ -592,11 +595,13 @@ mod tests {
             path: r"c:\temp\sample.exe".to_string(),
             size: 1337,
             mtime_nanos: 42,
+            match_debug: MatchDebugLevel::Off,
         };
         let updated = YaraFileIdentity {
             path: r"c:\temp\sample.exe".to_string(),
             size: 2048,
             mtime_nanos: 43,
+            match_debug: MatchDebugLevel::Off,
         };
 
         cache.insert(identity, Vec::new());

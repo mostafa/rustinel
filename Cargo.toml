@@ -70,8 +70,3 @@ windows-service = "0.8.0"
 
 [dev-dependencies]
 tempfile = "3.8"
-
-[[test]]
-name = "integration"
-path = "tests/integration.rs"
-harness = true
