@@ -23,7 +23,39 @@ struct ResponseTask {
 pub struct ResponseEngine {
     enabled: bool,
     min_severity: AlertSeverity,
+    prevention_enabled: bool,
+    self_pid: u32,
+    allowlist_images: Vec<String>,
+    allowlist_paths: Vec<String>,
     tx: mpsc::Sender<ResponseTask>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResponseDecision {
+    Disabled,
+    BelowSeverity {
+        severity: AlertSeverity,
+        min_severity: AlertSeverity,
+    },
+    MissingPid,
+    ProtectedPid {
+        pid: u32,
+    },
+    MissingImage {
+        pid: u32,
+    },
+    Allowlisted {
+        pid: u32,
+        image: String,
+    },
+    DryRun {
+        pid: u32,
+        image: String,
+    },
+    Terminate {
+        pid: u32,
+        image: String,
+    },
 }
 
 impl ResponseEngine {
@@ -32,6 +64,8 @@ impl ResponseEngine {
         let min_severity = parse_min_severity(&cfg.min_severity);
         let allowlist_images = normalize_allowlist_images(&cfg.allowlist_images);
         let allowlist_paths = normalize_allowlist_paths(&cfg.allowlist_paths);
+        let worker_allowlist_images = allowlist_images.clone();
+        let worker_allowlist_paths = allowlist_paths.clone();
         let prevention_enabled = cfg.prevention_enabled;
         let enabled = cfg.enabled;
         let self_pid = std::process::id();
@@ -50,8 +84,8 @@ impl ResponseEngine {
                     task,
                     prevention_enabled,
                     self_pid,
-                    &allowlist_images,
-                    &allowlist_paths,
+                    &worker_allowlist_images,
+                    &worker_allowlist_paths,
                 );
             }
 
@@ -62,6 +96,10 @@ impl ResponseEngine {
             Self {
                 enabled,
                 min_severity,
+                prevention_enabled,
+                self_pid,
+                allowlist_images,
+                allowlist_paths,
                 tx,
             },
             handle,
@@ -69,23 +107,18 @@ impl ResponseEngine {
     }
 
     pub fn handle_alert(&self, alert: &Alert) {
-        if !self.enabled {
-            return;
-        }
-
-        let effective_severity = match alert.engine {
-            DetectionEngine::Yara => AlertSeverity::Critical,
-            DetectionEngine::Sigma | DetectionEngine::Ioc => alert.severity,
-        };
-
-        if !severity_at_least(effective_severity, self.min_severity) {
+        let decision = self.decision_for_alert(alert);
+        if !matches!(
+            decision,
+            ResponseDecision::DryRun { .. } | ResponseDecision::Terminate { .. }
+        ) {
             return;
         }
 
         let (pid, image) = extract_process_info(alert);
 
         let task = ResponseTask {
-            severity: effective_severity,
+            severity: effective_alert_severity(alert),
             rule_name: alert.rule_name.clone(),
             engine: alert.engine,
             pid,
@@ -100,6 +133,79 @@ impl ResponseEngine {
             );
         }
     }
+
+    pub fn decision_for_alert(&self, alert: &Alert) -> ResponseDecision {
+        if !self.enabled {
+            return ResponseDecision::Disabled;
+        }
+
+        let severity = effective_alert_severity(alert);
+        if !severity_at_least(severity, self.min_severity) {
+            return ResponseDecision::BelowSeverity {
+                severity,
+                min_severity: self.min_severity,
+            };
+        }
+
+        let (pid, image) = extract_process_info(alert);
+        decide_response(
+            pid,
+            image.as_deref(),
+            self.prevention_enabled,
+            self.self_pid,
+            &self.allowlist_images,
+            &self.allowlist_paths,
+        )
+    }
+}
+
+fn effective_alert_severity(alert: &Alert) -> AlertSeverity {
+    match alert.engine {
+        DetectionEngine::Yara => AlertSeverity::Critical,
+        DetectionEngine::Sigma | DetectionEngine::Ioc => alert.severity,
+    }
+}
+
+fn decide_response(
+    pid: Option<u32>,
+    image: Option<&str>,
+    prevention_enabled: bool,
+    self_pid: u32,
+    allowlist_images: &[String],
+    allowlist_paths: &[String],
+) -> ResponseDecision {
+    let pid = match pid {
+        Some(pid) => pid,
+        None => return ResponseDecision::MissingPid,
+    };
+
+    if pid <= 4 || pid == self_pid {
+        return ResponseDecision::ProtectedPid { pid };
+    }
+
+    let image = match image {
+        Some(image) => image,
+        None => return ResponseDecision::MissingImage { pid },
+    };
+
+    if is_allowlisted(image, allowlist_images, allowlist_paths) {
+        return ResponseDecision::Allowlisted {
+            pid,
+            image: image.to_string(),
+        };
+    }
+
+    if prevention_enabled {
+        ResponseDecision::Terminate {
+            pid,
+            image: image.to_string(),
+        }
+    } else {
+        ResponseDecision::DryRun {
+            pid,
+            image: image.to_string(),
+        }
+    }
 }
 
 fn handle_task(
@@ -109,9 +215,15 @@ fn handle_task(
     allowlist_images: &[String],
     allowlist_paths: &[String],
 ) {
-    let pid = match task.pid {
-        Some(pid) => pid,
-        None => {
+    match decide_response(
+        task.pid,
+        task.image.as_deref(),
+        prevention_enabled,
+        self_pid,
+        allowlist_images,
+        allowlist_paths,
+    ) {
+        ResponseDecision::MissingPid => {
             warn!(
                 target: TARGET_RESPONSE,
                 rule = %task.rule_name,
@@ -121,23 +233,18 @@ fn handle_task(
             );
             return;
         }
-    };
-
-    if pid <= 4 || pid == self_pid {
-        info!(
-            target: TARGET_RESPONSE,
-            pid,
-            rule = %task.rule_name,
-            engine = ?task.engine,
-            severity = ?task.severity,
-            "Active response skipped: protected pid"
-        );
-        return;
-    }
-
-    let image = match task.image.as_deref() {
-        Some(image) => image,
-        None => {
+        ResponseDecision::ProtectedPid { pid } => {
+            info!(
+                target: TARGET_RESPONSE,
+                pid,
+                rule = %task.rule_name,
+                engine = ?task.engine,
+                severity = ?task.severity,
+                "Active response skipped: protected pid"
+            );
+            return;
+        }
+        ResponseDecision::MissingImage { pid } => {
             warn!(
                 target: TARGET_RESPONSE,
                 pid,
@@ -148,37 +255,7 @@ fn handle_task(
             );
             return;
         }
-    };
-
-    if is_allowlisted(image, allowlist_images, allowlist_paths) {
-        info!(
-            target: TARGET_RESPONSE,
-            pid,
-            image = %image,
-            rule = %task.rule_name,
-            engine = ?task.engine,
-            severity = ?task.severity,
-            "Active response skipped: allowlisted"
-        );
-        return;
-    }
-
-    if !prevention_enabled {
-        info!(
-            target: TARGET_RESPONSE,
-            pid,
-            image = %image,
-            rule = %task.rule_name,
-            engine = ?task.engine,
-            severity = ?task.severity,
-            dry_run = true,
-            "Active response would terminate process"
-        );
-        return;
-    }
-
-    match terminate_process(pid) {
-        Ok(()) => {
+        ResponseDecision::Allowlisted { pid, image } => {
             info!(
                 target: TARGET_RESPONSE,
                 pid,
@@ -186,21 +263,49 @@ fn handle_task(
                 rule = %task.rule_name,
                 engine = ?task.engine,
                 severity = ?task.severity,
-                "Active response terminated process"
+                "Active response skipped: allowlisted"
             );
+            return;
         }
-        Err(err) => {
-            error!(
+        ResponseDecision::DryRun { pid, image } => {
+            info!(
                 target: TARGET_RESPONSE,
                 pid,
                 image = %image,
                 rule = %task.rule_name,
                 engine = ?task.engine,
                 severity = ?task.severity,
-                error = %err,
-                "Active response failed to terminate process"
+                dry_run = true,
+                "Active response would terminate process"
             );
+            return;
         }
+        ResponseDecision::Terminate { pid, image } => match terminate_process(pid) {
+            Ok(()) => {
+                info!(
+                    target: TARGET_RESPONSE,
+                    pid,
+                    image = %image,
+                    rule = %task.rule_name,
+                    engine = ?task.engine,
+                    severity = ?task.severity,
+                    "Active response terminated process"
+                );
+            }
+            Err(err) => {
+                error!(
+                    target: TARGET_RESPONSE,
+                    pid,
+                    image = %image,
+                    rule = %task.rule_name,
+                    engine = ?task.engine,
+                    severity = ?task.severity,
+                    error = %err,
+                    "Active response failed to terminate process"
+                );
+            }
+        },
+        ResponseDecision::Disabled | ResponseDecision::BelowSeverity { .. } => {}
     }
 }
 

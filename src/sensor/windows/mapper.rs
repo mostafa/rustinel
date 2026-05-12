@@ -83,7 +83,7 @@ fn raw_event_id_for_record(category: EventCategory, action_code: u8, record: &Ev
 }
 
 /// Maps Windows ETW opcodes/event IDs to the existing Sysmon-compatible IDs.
-fn map_to_sysmon_id(category: EventCategory, action_code: u8, raw_event_id: u16) -> u16 {
+pub fn map_to_sysmon_id(category: EventCategory, action_code: u8, raw_event_id: u16) -> u16 {
     match category {
         EventCategory::Process => match action_code {
             1 => 1,

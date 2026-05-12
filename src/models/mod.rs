@@ -1200,7 +1200,7 @@ pub enum EventCategory {
 }
 
 /// Debug verbosity for match details in alerts
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MatchDebugLevel {
     Off,

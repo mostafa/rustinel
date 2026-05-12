@@ -1,0 +1,37 @@
+name: Privileged Smoke Tests
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  linux-privileged-smoke:
+    name: Linux Privileged Smoke
+    runs-on: [self-hosted, linux]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build memory target
+        run: cargo build --locked --example memory_target
+      - name: Run ignored YARA memory smoke tests
+        run: cargo test --locked --test yara_memory -- --include-ignored
+      - name: Run ignored active response smoke tests
+        run: cargo test --locked --test active_response -- --include-ignored
+
+  windows-privileged-smoke:
+    name: Windows Privileged Smoke
+    runs-on: [self-hosted, windows]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build memory target
+        run: cargo build --locked --example memory_target
+      - name: Run ignored YARA memory smoke tests
+        run: cargo test --locked --test yara_memory -- --include-ignored
+      - name: Run ignored active response smoke tests
+        run: cargo test --locked --test active_response -- --include-ignored

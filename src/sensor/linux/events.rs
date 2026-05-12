@@ -115,6 +115,149 @@ pub fn bytes_to_string(buf: &[u8]) -> String {
     String::from_utf8_lossy(&buf[..end]).into_owned()
 }
 
+#[cfg(target_os = "linux")]
+pub mod mapping {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::time::SystemTime;
+
+    use crate::models::{
+        DnsQueryFields, FileEventFields, NetworkConnectionFields, ProcessCreationFields,
+    };
+    use crate::sensor::{
+        Platform, ProcessStartKey, SensorAction, SensorEvent, SensorNormalization, SensorPayload,
+    };
+
+    use super::{bytes_to_string, DnsEvent, FileEvent, NetworkEvent, ProcessEvent};
+
+    const PROVIDER: &str = "ebpf";
+
+    pub fn process_event_to_sensor(event: &ProcessEvent) -> SensorEvent {
+        let action = match event.kind {
+            2 => SensorAction::Stop,
+            _ => SensorAction::Start,
+        };
+        SensorEvent {
+            platform: Platform::Linux,
+            provider: PROVIDER,
+            action,
+            normalization: SensorNormalization {
+                event_id: if action == SensorAction::Start { 1 } else { 5 },
+                action_code: event.kind as u8,
+            },
+            pid: Some(event.pid),
+            timestamp: SystemTime::now(),
+            process_start_key: Some(ProcessStartKey {
+                pid: event.pid,
+                start_time: 0,
+            }),
+            payload: SensorPayload::Process(ProcessCreationFields {
+                image: Some(bytes_to_string(&event.image)),
+                original_file_name: None,
+                product: None,
+                description: None,
+                target_image: None,
+                command_line: None,
+                process_id: Some(event.pid.to_string()),
+                parent_process_id: None,
+                parent_image: None,
+                parent_command_line: None,
+                current_directory: None,
+                integrity_level: None,
+                user: Some(event.uid.to_string()),
+                logon_id: None,
+                logon_guid: None,
+            }),
+        }
+    }
+
+    pub fn network_event_to_sensor(event: &NetworkEvent) -> SensorEvent {
+        SensorEvent {
+            platform: Platform::Linux,
+            provider: PROVIDER,
+            action: SensorAction::Connect,
+            normalization: SensorNormalization {
+                event_id: 3,
+                action_code: 12,
+            },
+            pid: Some(event.pid),
+            timestamp: SystemTime::now(),
+            process_start_key: None,
+            payload: SensorPayload::Network(NetworkConnectionFields {
+                destination_ip: Some(ip_to_string(event.af, &event.daddr)),
+                source_ip: Some(ip_to_string(event.af, &event.saddr)),
+                destination_port: Some(event.dport.to_string()),
+                source_port: Some(event.sport.to_string()),
+                process_id: Some(event.pid.to_string()),
+                image: None,
+                user: Some(event.uid.to_string()),
+                destination_hostname: None,
+                protocol: Some("tcp".to_string()),
+            }),
+        }
+    }
+
+    pub fn file_event_to_sensor(event: &FileEvent) -> SensorEvent {
+        let (action, event_id, action_code) = match event.kind {
+            2 => (SensorAction::Delete, 23, 70),
+            3 => (SensorAction::Rename, 71, 71),
+            4 => (SensorAction::Modify, 11, 65),
+            _ => (SensorAction::Create, 11, 64),
+        };
+        SensorEvent {
+            platform: Platform::Linux,
+            provider: PROVIDER,
+            action,
+            normalization: SensorNormalization {
+                event_id,
+                action_code,
+            },
+            pid: Some(event.pid),
+            timestamp: SystemTime::now(),
+            process_start_key: None,
+            payload: SensorPayload::File(FileEventFields {
+                source_filename: (action == SensorAction::Rename)
+                    .then(|| bytes_to_string(&event.aux_path)),
+                target_filename: Some(bytes_to_string(&event.path)),
+                process_id: Some(event.pid.to_string()),
+                image: Some(bytes_to_string(&event.comm)),
+                creation_utc_time: None,
+                previous_creation_utc_time: None,
+                user: Some(event.uid.to_string()),
+            }),
+        }
+    }
+
+    pub fn dns_event_to_sensor(event: &DnsEvent) -> SensorEvent {
+        SensorEvent {
+            platform: Platform::Linux,
+            provider: PROVIDER,
+            action: SensorAction::Query,
+            normalization: SensorNormalization {
+                event_id: 22,
+                action_code: event.kind as u8,
+            },
+            pid: Some(event.pid),
+            timestamp: SystemTime::now(),
+            process_start_key: None,
+            payload: SensorPayload::Dns(DnsQueryFields {
+                query_name: Some(bytes_to_string(&event.query_name)),
+                query_results: Some(bytes_to_string(&event.query_results)),
+                record_type: Some(bytes_to_string(&event.record_type)),
+                query_status: None,
+                process_id: Some(event.pid.to_string()),
+                image: None,
+            }),
+        }
+    }
+
+    fn ip_to_string(af: u16, bytes: &[u8; 16]) -> String {
+        match af {
+            10 => Ipv6Addr::from(*bytes).to_string(),
+            _ => Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]).to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
