@@ -130,7 +130,7 @@ fn match_debug_configuration_controls_sigma_and_yara_details() {
     );
     full.load_rules(sigma.rules_dir()).expect("load full rule");
     let details = full.check_event(&event).unwrap().match_details.unwrap();
-    assert!(details.sigma.expect("sigma details").matches.len() > 0);
+    assert!(!details.sigma.expect("sigma details").matches.is_empty());
 
     let yara = YaraFixture::new();
     yara.write_default_rule();
