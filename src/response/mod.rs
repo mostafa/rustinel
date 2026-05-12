@@ -231,7 +231,6 @@ fn handle_task(
                 severity = ?task.severity,
                 "Active response skipped: missing pid"
             );
-            return;
         }
         ResponseDecision::ProtectedPid { pid } => {
             info!(
@@ -242,7 +241,6 @@ fn handle_task(
                 severity = ?task.severity,
                 "Active response skipped: protected pid"
             );
-            return;
         }
         ResponseDecision::MissingImage { pid } => {
             warn!(
@@ -253,7 +251,6 @@ fn handle_task(
                 severity = ?task.severity,
                 "Active response skipped: missing image"
             );
-            return;
         }
         ResponseDecision::Allowlisted { pid, image } => {
             info!(
@@ -265,7 +262,6 @@ fn handle_task(
                 severity = ?task.severity,
                 "Active response skipped: allowlisted"
             );
-            return;
         }
         ResponseDecision::DryRun { pid, image } => {
             info!(
@@ -278,7 +274,6 @@ fn handle_task(
                 dry_run = true,
                 "Active response would terminate process"
             );
-            return;
         }
         ResponseDecision::Terminate { pid, image } => match terminate_process(pid) {
             Ok(()) => {

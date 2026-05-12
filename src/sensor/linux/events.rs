@@ -116,6 +116,7 @@ pub fn bytes_to_string(buf: &[u8]) -> String {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 pub mod mapping {
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::time::SystemTime;
