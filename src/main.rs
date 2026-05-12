@@ -8,6 +8,7 @@ mod alerts;
 mod config;
 mod engine;
 mod ioc;
+mod memory;
 mod models;
 mod normalizer;
 mod reload;
@@ -25,6 +26,8 @@ use engine::{Engine, SigmaDetectionHandler};
 #[cfg(any(windows, target_os = "linux"))]
 use ioc::{HashCache, HashRequirements, IocEngine};
 #[cfg(any(windows, target_os = "linux"))]
+use memory::MemoryScanConfig;
+#[cfg(any(windows, target_os = "linux"))]
 use models::{
     Alert, AlertSeverity, DetectionEngine, EventCategory, EventFields, MatchDebugLevel,
     MatchDetails, NormalizedEvent, ProcessCreationFields, YaraMatchDetails, YaraRuleMatch,
@@ -36,7 +39,7 @@ use reload::DetectorStore;
 #[cfg(any(windows, target_os = "linux"))]
 use response::ResponseEngine;
 #[cfg(any(windows, target_os = "linux"))]
-use scanner::YaraEventHandler;
+use scanner::{YaraEventHandler, YaraMemoryJob};
 #[cfg(any(windows, target_os = "linux"))]
 use sensor::{Platform, Sensor, SensorEvent, SensorEventRouter};
 #[cfg(any(windows, target_os = "linux"))]
@@ -648,6 +651,83 @@ fn build_yara_alert(
     }
 }
 
+#[cfg(any(windows, target_os = "linux"))]
+fn build_yara_memory_match_details(
+    match_debug: MatchDebugLevel,
+    rule_match: &YaraRuleMatch,
+    chunk: &memory::MemoryChunk,
+) -> Option<MatchDetails> {
+    if matches!(match_debug, MatchDebugLevel::Off) {
+        return None;
+    }
+
+    let summary = format!(
+        "matched YARA rule {} in process memory at 0x{:x} {:?} {}{}{}",
+        rule_match.rule,
+        chunk.base,
+        chunk.region.kind,
+        if chunk.region.readable { 'r' } else { '-' },
+        if chunk.region.writable { 'w' } else { '-' },
+        if chunk.region.executable { 'x' } else { '-' },
+    );
+
+    let mut rule = rule_match.clone();
+    if !matches!(match_debug, MatchDebugLevel::Full) {
+        rule.strings.clear();
+    }
+
+    Some(MatchDetails {
+        summary,
+        sigma: None,
+        yara: Some(YaraMatchDetails { rules: vec![rule] }),
+    })
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn build_yara_memory_alert(
+    rule_name: &str,
+    image: &str,
+    pid: u32,
+    match_details: Option<MatchDetails>,
+    platform: Platform,
+    provider: &str,
+) -> Alert {
+    Alert {
+        severity: AlertSeverity::Critical,
+        rule_name: rule_name.to_string(),
+        rule_description: None,
+        engine: DetectionEngine::Yara,
+        event: NormalizedEvent {
+            timestamp: utils::now_timestamp_string(),
+            platform,
+            provider: provider.to_string(),
+            category: EventCategory::Process,
+            event_id: 1,
+            event_id_string: "1".to_string(),
+            opcode: 1,
+            fields: EventFields::ProcessCreation(ProcessCreationFields {
+                image: Some(image.to_string()),
+                original_file_name: None,
+                product: None,
+                description: None,
+                target_image: None,
+                command_line: None,
+                process_id: Some(pid.to_string()),
+                parent_process_id: None,
+                parent_image: None,
+                parent_command_line: None,
+                current_directory: None,
+                integrity_level: None,
+                user: None,
+                logon_id: None,
+                logon_guid: None,
+            }),
+            process_context: None,
+        },
+        match_details,
+    }
+}
+
 // ── Windows ETW EDR ───────────────────────────────────────────────────────────
 
 // Native API FFI structures for NtQuerySystemInformation
@@ -1091,6 +1171,16 @@ async fn run_edr(
     // Buffer = 1000 items. If 1000 processes start instantly, we drop events rather than blocking.
     let (tx, mut rx) = mpsc::channel::<(String, u32)>(1000);
 
+    // Create optional YARA memory scanning channel.
+    let (yara_memory_tx, yara_memory_rx) =
+        if cfg.scanner.yara_enabled && cfg.scanner.yara_memory_enabled {
+            let capacity = cfg.scanner.yara_memory_queue_capacity.max(1);
+            let (tx, rx) = mpsc::channel::<YaraMemoryJob>(capacity);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
     // Initialize IOC engine
     let ioc_engine = Arc::new(IocEngine::load(&cfg.ioc));
     if ioc_engine.is_enabled() {
@@ -1229,6 +1319,83 @@ async fn run_edr(
         }
         info!(target: "scanner", "YARA worker thread shutting down");
     });
+
+    // Spawn optional YARA memory scanning worker.
+    let yara_memory_worker_handle = if let Some(mut mem_rx) = yara_memory_rx {
+        let detectors_for_mem = Arc::clone(&detectors);
+        let alert_sink_for_mem = alert_sink.clone();
+        let response_engine_for_mem = response_engine.clone();
+        let mem_cfg = MemoryScanConfig {
+            max_process_bytes: (cfg.scanner.yara_memory_max_process_mb * 1024 * 1024) as usize,
+            max_region_bytes: (cfg.scanner.yara_memory_max_region_mb * 1024 * 1024) as usize,
+            include_private: cfg.scanner.yara_memory_include_private,
+            include_image: cfg.scanner.yara_memory_include_image,
+            include_mapped: cfg.scanner.yara_memory_include_mapped,
+            delay_ms: cfg.scanner.yara_memory_delay_ms,
+        };
+        let mem_match_debug = cfg.alerts.match_debug;
+        Some(tokio::task::spawn_blocking(move || {
+            info!(target: "scanner", "YARA memory worker started");
+            while let Some(job) = mem_rx.blocking_recv() {
+                std::thread::sleep(Duration::from_millis(mem_cfg.delay_ms));
+                let chunks = match memory::read_process_memory_chunks(job.pid, &mem_cfg) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        tracing::trace!(
+                            target: "scanner",
+                            pid = job.pid,
+                            image = %job.image,
+                            error = %err,
+                            "YARA memory scan skipped"
+                        );
+                        continue;
+                    }
+                };
+                let scanner = detectors_for_mem.yara();
+                for chunk in &chunks {
+                    let matches = match scanner.scan_bytes(&chunk.bytes, mem_match_debug) {
+                        Ok(m) => m,
+                        Err(err) => {
+                            tracing::trace!(
+                                target: "scanner",
+                                pid = job.pid,
+                                error = %err,
+                                "YARA memory chunk scan failed"
+                            );
+                            continue;
+                        }
+                    };
+                    if !matches.is_empty() {
+                        let rule_names: Vec<String> =
+                            matches.iter().map(|r| r.rule.clone()).collect();
+                        warn!(
+                            pid = job.pid,
+                            image = %job.image,
+                            rules = ?rule_names,
+                            "YARA memory detection triggered"
+                        );
+                        for rule_match in &matches {
+                            let details =
+                                build_yara_memory_match_details(mem_match_debug, rule_match, chunk);
+                            let alert = build_yara_memory_alert(
+                                &rule_match.rule,
+                                &job.image,
+                                job.pid,
+                                details,
+                                Platform::Windows,
+                                "yara-memory",
+                            );
+                            alert_sink_for_mem.write_alert(&alert);
+                            response_engine_for_mem.handle_alert(&alert);
+                        }
+                    }
+                }
+            }
+            info!(target: "scanner", "YARA memory worker shutting down");
+        }))
+    } else {
+        None
+    };
 
     // Create background worker channel for IOC hashing (process start only)
     // Uses spawn_blocking to avoid starving the tokio async thread pool with
@@ -1385,6 +1552,7 @@ async fn run_edr(
     // Create YARA event handler
     let yara_handler = YaraEventHandler {
         tx,
+        memory_tx: yara_memory_tx,
         allowlist_paths: yara_allowlist_paths,
     };
 
@@ -1487,6 +1655,13 @@ async fn run_edr(
     match yara_worker_handle.await {
         Ok(_) => info!("YARA worker thread finished"),
         Err(e) => error!("Failed to join YARA worker thread: {}", e),
+    }
+
+    if let Some(handle) = yara_memory_worker_handle {
+        match handle.await {
+            Ok(_) => info!("YARA memory worker thread finished"),
+            Err(e) => error!("Failed to join YARA memory worker thread: {}", e),
+        }
     }
 
     if let Some(handle) = ioc_hash_worker_handle.take() {
@@ -1642,6 +1817,15 @@ async fn run_linux_edr() -> anyhow::Result<()> {
 
     // 9. YARA background worker
     let (yara_tx, mut yara_rx) = mpsc::channel::<(String, u32)>(1000);
+
+    let (yara_memory_tx, yara_memory_rx) =
+        if cfg.scanner.yara_enabled && cfg.scanner.yara_memory_enabled {
+            let capacity = cfg.scanner.yara_memory_queue_capacity.max(1);
+            let (tx, rx) = mpsc::channel::<YaraMemoryJob>(capacity);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
     let detectors_for_yara = Arc::clone(&detectors);
     let yara_allowlist_paths_for_worker = yara_allowlist_paths.clone();
     let alert_sink_for_yara = alert_sink.clone();
@@ -1687,6 +1871,83 @@ async fn run_linux_edr() -> anyhow::Result<()> {
             }
         }
     });
+
+    // Spawn optional YARA memory scanning worker (Linux).
+    let yara_memory_worker_handle = if let Some(mut mem_rx) = yara_memory_rx {
+        let detectors_for_mem = Arc::clone(&detectors);
+        let alert_sink_for_mem = alert_sink.clone();
+        let response_engine_for_mem = response_engine.clone();
+        let mem_cfg = MemoryScanConfig {
+            max_process_bytes: (cfg.scanner.yara_memory_max_process_mb * 1024 * 1024) as usize,
+            max_region_bytes: (cfg.scanner.yara_memory_max_region_mb * 1024 * 1024) as usize,
+            include_private: cfg.scanner.yara_memory_include_private,
+            include_image: cfg.scanner.yara_memory_include_image,
+            include_mapped: cfg.scanner.yara_memory_include_mapped,
+            delay_ms: cfg.scanner.yara_memory_delay_ms,
+        };
+        let mem_match_debug = cfg.alerts.match_debug;
+        Some(tokio::task::spawn_blocking(move || {
+            info!(target: "scanner", "YARA memory worker started");
+            while let Some(job) = mem_rx.blocking_recv() {
+                std::thread::sleep(Duration::from_millis(mem_cfg.delay_ms));
+                let chunks = match memory::read_process_memory_chunks(job.pid, &mem_cfg) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        tracing::trace!(
+                            target: "scanner",
+                            pid = job.pid,
+                            image = %job.image,
+                            error = %err,
+                            "YARA memory scan skipped"
+                        );
+                        continue;
+                    }
+                };
+                let scanner = detectors_for_mem.yara();
+                for chunk in &chunks {
+                    let matches = match scanner.scan_bytes(&chunk.bytes, mem_match_debug) {
+                        Ok(m) => m,
+                        Err(err) => {
+                            tracing::trace!(
+                                target: "scanner",
+                                pid = job.pid,
+                                error = %err,
+                                "YARA memory chunk scan failed"
+                            );
+                            continue;
+                        }
+                    };
+                    if !matches.is_empty() {
+                        let rule_names: Vec<String> =
+                            matches.iter().map(|r| r.rule.clone()).collect();
+                        warn!(
+                            pid = job.pid,
+                            image = %job.image,
+                            rules = ?rule_names,
+                            "YARA memory detection triggered"
+                        );
+                        for rule_match in &matches {
+                            let details =
+                                build_yara_memory_match_details(mem_match_debug, rule_match, chunk);
+                            let alert = build_yara_memory_alert(
+                                &rule_match.rule,
+                                &job.image,
+                                job.pid,
+                                details,
+                                Platform::Linux,
+                                "yara-memory",
+                            );
+                            alert_sink_for_mem.write_alert(&alert);
+                            response_engine_for_mem.handle_alert(&alert);
+                        }
+                    }
+                }
+            }
+            info!(target: "scanner", "YARA memory worker shutting down");
+        }))
+    } else {
+        None
+    };
 
     // 10. IOC hash background worker
     let (ioc_hash_tx, mut ioc_hash_worker_handle) = if ioc_engine.is_enabled() {
@@ -1781,6 +2042,7 @@ async fn run_linux_edr() -> anyhow::Result<()> {
     };
     let yara_handler = YaraEventHandler {
         tx: yara_tx,
+        memory_tx: yara_memory_tx,
         allowlist_paths: yara_allowlist_paths,
     };
     let mut router_inner = SensorEventRouter::new();
@@ -1820,6 +2082,9 @@ async fn run_linux_edr() -> anyhow::Result<()> {
     drop(response_engine);
     let _ = sensor_worker_handle.await;
     let _ = yara_worker_handle.await;
+    if let Some(h) = yara_memory_worker_handle {
+        let _ = h.await;
+    }
     if let Some(h) = ioc_hash_worker_handle.take() {
         let _ = h.await;
     }

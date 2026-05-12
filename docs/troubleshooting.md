@@ -170,6 +170,37 @@ Typical symptom in logs:
 YARA queue full; dropping scan job
 ```
 
+### YARA memory scan produces no alerts
+
+Check these first:
+
+- `scanner.yara_memory_enabled` must be `true` and `scanner.yara_enabled` must also be `true`
+- the process path may be allowlisted via `scanner.yara_allowlist_paths`
+- the memory scan queue may have been full and the job dropped (look for `YARA memory queue full; dropping scan job`)
+- the process may have exited before the scan ran (the worker waits `yara_memory_delay_ms` first)
+- per-region or per-process byte caps may have prevented reading the region containing the match
+- insufficient privileges may prevent reading process memory (see below)
+
+#### Linux memory scanning privileges
+
+On Linux, reading `/proc/<pid>/mem` typically requires root or the `CAP_SYS_PTRACE` capability. You may also need to set a permissive ptrace scope:
+
+```bash
+echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
+```
+
+Without adequate privileges, region reads will fail silently (logged at `trace`).
+
+#### Windows memory scanning privileges
+
+On Windows, `OpenProcess` with `PROCESS_VM_READ` may fail for:
+
+- protected processes (`PROTECTED_PROCESS_LIGHT` or `PROTECTED_PROCESS`)
+- system processes with elevated integrity levels
+- some anti-tamper or security software
+
+These failures are logged at `trace` and do not affect other detection paths.
+
 ### IOC hash matching did not fire
 
 Hash matching is more selective than inline IOC checks.

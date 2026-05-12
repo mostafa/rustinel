@@ -26,6 +26,15 @@ sigma_rules_path = "rules/sigma"
 yara_enabled = true
 yara_rules_path = "rules/yara"
 
+# Memory scanning is off by default.
+# yara_memory_enabled = false
+# yara_memory_delay_ms = 750
+# yara_memory_max_process_mb = 64
+# yara_memory_max_region_mb = 8
+# yara_memory_include_private = true
+# yara_memory_include_image = false
+# yara_memory_include_mapped = false
+
 [reload]
 enabled = true
 debounce_ms = 2000
@@ -124,6 +133,14 @@ These defaults feed `allowlist.paths`, which then propagate to active response, 
 | `yara_enabled` | `true` | Enable YARA scanning |
 | `yara_rules_path` | `rules/yara` | YARA rules directory |
 | `yara_allowlist_paths` | inherits `allowlist.paths` | Prefix paths skipped by YARA queueing and scanning |
+| `yara_memory_enabled` | `false` | Enable YARA memory scanning (requires `yara_enabled = true`) |
+| `yara_memory_queue_capacity` | `64` | Maximum pending memory scan jobs before new ones are dropped |
+| `yara_memory_delay_ms` | `750` | Milliseconds to wait after process start before reading memory |
+| `yara_memory_max_process_mb` | `64` | Stop reading a process once this many MB have been accumulated |
+| `yara_memory_max_region_mb` | `8` | Clamp each region read to this many MB |
+| `yara_memory_include_private` | `true` | Scan private (anonymous) memory regions |
+| `yara_memory_include_image` | `false` | Scan image-backed regions (loaded executables/DLLs) |
+| `yara_memory_include_mapped` | `false` | Scan file-mapped regions |
 
 ### Reload
 

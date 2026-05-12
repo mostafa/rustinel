@@ -200,6 +200,13 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     out
 }
 
+/// Job queued from a process-start event for background memory scanning.
+#[derive(Debug, Clone)]
+pub struct YaraMemoryJob {
+    pub pid: u32,
+    pub image: String,
+}
+
 /// Main Scanner struct holding compiled rules
 pub struct Scanner {
     rules: Rules,
@@ -290,63 +297,10 @@ impl Scanner {
         let mut scan_ok = false;
         let mut scanner = XScanner::new(&self.rules);
 
-        // Scan the file
         match scanner.scan_file(path) {
             Ok(scan_results) => {
                 scan_ok = true;
-                for rule in scan_results.matching_rules() {
-                    let rule_name = rule.identifier().to_string();
-                    let include_meta = !matches!(match_debug, MatchDebugLevel::Off);
-                    let include_strings = matches!(match_debug, MatchDebugLevel::Full);
-
-                    let tags = if include_meta {
-                        rule.tags()
-                            .map(|tag| tag.identifier().to_string())
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-
-                    let namespace = if include_meta {
-                        Some(rule.namespace().to_string())
-                    } else {
-                        None
-                    };
-
-                    let mut strings = Vec::new();
-                    if include_strings {
-                        let mut count = 0usize;
-                        for pattern in rule.patterns() {
-                            let pattern_id = pattern.identifier().to_string();
-                            for m in pattern.matches() {
-                                if count >= MAX_YARA_STRINGS_PER_RULE {
-                                    break;
-                                }
-                                let offset = m.range().start as u64;
-                                let snippet_raw = String::from_utf8_lossy(m.data()).to_string();
-                                let snippet = truncate_str(&snippet_raw, MAX_YARA_SNIPPET_LEN);
-
-                                strings.push(YaraStringMatch {
-                                    id: pattern_id.clone(),
-                                    offset: Some(offset),
-                                    snippet: Some(snippet),
-                                });
-
-                                count += 1;
-                            }
-                            if count >= MAX_YARA_STRINGS_PER_RULE {
-                                break;
-                            }
-                        }
-                    }
-
-                    matches.push(YaraRuleMatch {
-                        rule: rule_name,
-                        tags,
-                        namespace,
-                        strings,
-                    });
-                }
+                matches = collect_yara_matches(scan_results, match_debug);
             }
             Err(e) => {
                 // File locking issues are common in EDR; keep these at trace to avoid debug spam.
@@ -369,11 +323,93 @@ impl Scanner {
 
         Ok(matches)
     }
+
+    /// Scan a byte slice and return matching rule details.
+    pub fn scan_bytes(
+        &self,
+        data: &[u8],
+        match_debug: MatchDebugLevel,
+    ) -> Result<Vec<YaraRuleMatch>> {
+        let mut scanner = XScanner::new(&self.rules);
+        match scanner.scan(data) {
+            Ok(scan_results) => Ok(collect_yara_matches(scan_results, match_debug)),
+            Err(err) => {
+                tracing::trace!(
+                    target: "scanner",
+                    error = %err,
+                    "Skipping YARA memory chunk"
+                );
+                Ok(Vec::new())
+            }
+        }
+    }
+}
+
+fn collect_yara_matches(
+    scan_results: yara_x::ScanResults,
+    match_debug: MatchDebugLevel,
+) -> Vec<YaraRuleMatch> {
+    let mut matches = Vec::new();
+
+    for rule in scan_results.matching_rules() {
+        let rule_name = rule.identifier().to_string();
+        let include_meta = !matches!(match_debug, MatchDebugLevel::Off);
+        let include_strings = matches!(match_debug, MatchDebugLevel::Full);
+
+        let tags = if include_meta {
+            rule.tags()
+                .map(|tag| tag.identifier().to_string())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let namespace = if include_meta {
+            Some(rule.namespace().to_string())
+        } else {
+            None
+        };
+
+        let mut strings = Vec::new();
+        if include_strings {
+            let mut count = 0usize;
+            for pattern in rule.patterns() {
+                let pattern_id = pattern.identifier().to_string();
+                for m in pattern.matches() {
+                    if count >= MAX_YARA_STRINGS_PER_RULE {
+                        break;
+                    }
+                    let offset = m.range().start as u64;
+                    let snippet_raw = String::from_utf8_lossy(m.data()).to_string();
+                    let snippet = truncate_str(&snippet_raw, MAX_YARA_SNIPPET_LEN);
+                    strings.push(YaraStringMatch {
+                        id: pattern_id.clone(),
+                        offset: Some(offset),
+                        snippet: Some(snippet),
+                    });
+                    count += 1;
+                }
+                if count >= MAX_YARA_STRINGS_PER_RULE {
+                    break;
+                }
+            }
+        }
+
+        matches.push(YaraRuleMatch {
+            rule: rule_name,
+            tags,
+            namespace,
+            strings,
+        });
+    }
+
+    matches
 }
 
 /// Sensor-event handler that sends file paths to the background worker.
 pub struct YaraEventHandler {
-    pub tx: Sender<(String, u32)>, // Sends (FilePath, PID)
+    pub tx: Sender<(String, u32)>,
+    pub memory_tx: Option<Sender<YaraMemoryJob>>,
     pub allowlist_paths: Vec<String>,
 }
 
@@ -427,6 +463,27 @@ impl SensorEventHandler for YaraEventHandler {
                 error = %err,
                 "YARA queue full; dropping scan job"
             ),
+        }
+
+        if let Some(memory_tx) = &self.memory_tx {
+            match memory_tx.try_send(YaraMemoryJob {
+                pid,
+                image: path.to_string(),
+            }) {
+                Ok(_) => tracing::trace!(
+                    target: "scanner",
+                    pid = pid,
+                    file = path,
+                    "YARA queued process for memory scan"
+                ),
+                Err(err) => warn!(
+                    target: "scanner",
+                    pid = pid,
+                    file = path,
+                    error = %err,
+                    "YARA memory queue full; dropping scan job"
+                ),
+            }
         }
     }
 }
