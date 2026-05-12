@@ -343,5 +343,3 @@ jobs:
             3. Run as Administrator: `.\rustinel.exe run`
 
             **Requirements:** Windows 10/11 or Server 2016+ (x64), Administrator privileges.
-
-            ## What's Changed

@@ -1,0 +1,32 @@
+changelog:
+  categories:
+    - title: Features
+      labels:
+        - feature
+        - feat
+        - enhancement
+    - title: Bug Fixes
+      labels:
+        - bug
+        - fix
+        - bugfix
+    - title: Refactoring
+      labels:
+        - refactor
+        - refactoring
+    - title: Documentation
+      labels:
+        - documentation
+        - docs
+    - title: CI/CD
+      labels:
+        - ci
+        - ci-cd
+        - workflow
+    - title: Dependencies
+      labels:
+        - dependencies
+        - chore
+    - title: Other Changes
+      labels:
+        - "*"
