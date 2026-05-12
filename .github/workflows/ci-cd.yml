@@ -93,7 +93,7 @@ jobs:
           cp target/bpfel-unknown-none/release/rustinel-ebpf rustinel-ebpf.o
 
       - name: Upload eBPF artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: rustinel-ebpf-object
           path: ebpf/rustinel-ebpf.o
@@ -151,7 +151,7 @@ jobs:
       - name: Build
         run: cargo build --locked --release --target x86_64-unknown-linux-musl
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: rustinel-linux-x86_64
           path: target/x86_64-unknown-linux-musl/release/rustinel
@@ -184,7 +184,7 @@ jobs:
       - name: Build
         run: cross build --locked --release --target aarch64-unknown-linux-musl
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: rustinel-linux-arm64
           path: target/aarch64-unknown-linux-musl/release/rustinel
@@ -209,7 +209,7 @@ jobs:
           $sizeMB = [math]::Round((Get-Item target/release/rustinel.exe).Length / 1MB, 2)
           Write-Output "Binary: target/release/rustinel.exe ($sizeMB MB)"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: rustinel-windows-x86_64
           path: target/release/rustinel.exe
