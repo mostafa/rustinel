@@ -41,6 +41,7 @@ pub trait SensorEventHandler: Send + Sync {
 pub enum Platform {
     Windows,
     Linux,
+    MacOS,
 }
 
 /// High-level action emitted by a sensor event.

@@ -127,6 +127,7 @@ fn sigma_file_detection_pipeline_maps_create_delete_rename_and_ecs() {
         let product = match platform {
             Platform::Windows => "windows",
             Platform::Linux => "linux",
+            Platform::MacOS => "macos",
         };
         fixture.write_rule(
             "file_create.yml",
