@@ -27,7 +27,19 @@ fn default_allowlist_paths() -> Vec<String> {
             "C:\\Program Files (x86)\\".to_string(),
         ]
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        vec![
+            "/usr/bin/".to_string(),
+            "/usr/sbin/".to_string(),
+            "/usr/libexec/".to_string(), // system helper executables
+            "/bin/".to_string(),
+            "/sbin/".to_string(),
+            "/System/".to_string(),      // OS-shipped frameworks and binaries
+            "/Applications/".to_string(), // installed applications
+        ]
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         vec![
             "/usr/bin/".to_string(),

@@ -423,20 +423,20 @@ fn parse_pid(value: Option<&str>) -> Option<u32> {
 }
 
 fn normalize_path(value: &str) -> String {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         value.trim().to_ascii_lowercase()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         value.trim().replace('/', "\\").to_ascii_lowercase()
     }
 }
 
 fn normalize_allowlist_paths(values: &[String]) -> Vec<String> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     const SEP: char = '/';
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     const SEP: char = '\\';
 
     values
