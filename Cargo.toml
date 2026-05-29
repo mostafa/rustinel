@@ -59,6 +59,10 @@ config = "0.15.23"
 aya = { version = "0.13", default-features = false }
 libc = "0.2"
 
+# macOS-specific
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 # Windows-specific
 [target.'cfg(windows)'.dependencies]
 # PE parsing and memory-mapped I/O (Windows-only; PE metadata is not used on Linux)
