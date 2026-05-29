@@ -29,14 +29,16 @@ fn default_allowlist_paths() -> Vec<String> {
     }
     #[cfg(target_os = "macos")]
     {
+        // OS-shipped directories only. /Applications is intentionally excluded:
+        // it holds user-installed software and is a common location for macOS
+        // malware, so allowlisting it would blind scanning and response there.
         vec![
             "/usr/bin/".to_string(),
             "/usr/sbin/".to_string(),
             "/usr/libexec/".to_string(), // system helper executables
             "/bin/".to_string(),
             "/sbin/".to_string(),
-            "/System/".to_string(),      // OS-shipped frameworks and binaries
-            "/Applications/".to_string(), // installed applications
+            "/System/".to_string(), // OS-shipped frameworks and binaries
         ]
     }
     #[cfg(not(any(windows, target_os = "macos")))]
