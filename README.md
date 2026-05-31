@@ -245,7 +245,7 @@ cargo build --release
 sudo ./target/release/rustinel run
 ```
 
-For full release setup, source-build prerequisites, and validation steps, see the [Getting Started](https://karib0u.github.io/rustinel/getting-started/) documentation.
+For full release setup, source-build prerequisites, and validation steps, see the [Getting Started](https://docs.rustinel.io/getting-started/) documentation.
 
 ---
 
@@ -304,15 +304,15 @@ See the [full roadmap](docs/roadmap.md) for details.
 
 ## Documentation
 
-- [Documentation Home](https://karib0u.github.io/rustinel/)
-- [Getting Started](https://karib0u.github.io/rustinel/getting-started/)
-- [Configuration](https://karib0u.github.io/rustinel/configuration/)
-- [Detection](https://karib0u.github.io/rustinel/detection/)
-- [Architecture](https://karib0u.github.io/rustinel/architecture/)
-- [Development](https://karib0u.github.io/rustinel/development/)
-- [Operations and Upgrade Guide](https://karib0u.github.io/rustinel/operations/)
-- [Troubleshooting](https://karib0u.github.io/rustinel/troubleshooting/)
-- [FAQ](https://karib0u.github.io/rustinel/faq/)
+- [Documentation Home](https://docs.rustinel.io/)
+- [Getting Started](https://docs.rustinel.io/getting-started/)
+- [Configuration](https://docs.rustinel.io/configuration/)
+- [Detection](https://docs.rustinel.io/detection/)
+- [Architecture](https://docs.rustinel.io/architecture/)
+- [Development](https://docs.rustinel.io/development/)
+- [Operations and Upgrade Guide](https://docs.rustinel.io/operations/)
+- [Troubleshooting](https://docs.rustinel.io/troubleshooting/)
+- [FAQ](https://docs.rustinel.io/faq/)
 
 ---
 
