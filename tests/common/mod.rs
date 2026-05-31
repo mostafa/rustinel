@@ -72,34 +72,35 @@ pub fn provider_for(platform: Platform) -> &'static str {
     match platform {
         Platform::Windows => "etw",
         Platform::Linux => "ebpf",
+        Platform::MacOS => "esf",
     }
 }
 
 pub fn image_for(platform: Platform) -> &'static str {
     match platform {
         Platform::Windows => r"C:\Windows\System32\curl.exe",
-        Platform::Linux => "/usr/bin/curl",
+        Platform::Linux | Platform::MacOS => "/usr/bin/curl",
     }
 }
 
 pub fn parent_image_for(platform: Platform) -> &'static str {
     match platform {
         Platform::Windows => r"C:\Windows\explorer.exe",
-        Platform::Linux => "/usr/bin/bash",
+        Platform::Linux | Platform::MacOS => "/usr/bin/bash",
     }
 }
 
 pub fn test_file_path(platform: Platform) -> &'static str {
     match platform {
         Platform::Windows => r"C:\Users\alice\AppData\Local\Temp\rustinel-fixture.txt",
-        Platform::Linux => "/tmp/rustinel-fixture.txt",
+        Platform::Linux | Platform::MacOS => "/tmp/rustinel-fixture.txt",
     }
 }
 
 pub fn renamed_test_file_path(platform: Platform) -> &'static str {
     match platform {
         Platform::Windows => r"C:\Users\alice\AppData\Local\Temp\rustinel-renamed.txt",
-        Platform::Linux => "/tmp/rustinel-renamed.txt",
+        Platform::Linux | Platform::MacOS => "/tmp/rustinel-renamed.txt",
     }
 }
 
@@ -255,7 +256,7 @@ fn file_event(
 fn temp_current_directory(platform: Platform) -> &'static str {
     match platform {
         Platform::Windows => r"C:\Users\alice\AppData\Local\Temp",
-        Platform::Linux => "/tmp",
+        Platform::Linux | Platform::MacOS => "/tmp",
     }
 }
 
@@ -287,7 +288,7 @@ impl SigmaFixture {
         let product = platform_product(platform);
         let image_suffix = match platform {
             Platform::Windows => "curl.exe",
-            Platform::Linux => "/curl",
+            Platform::Linux | Platform::MacOS => "/curl",
         };
         self.write_rule(
             "process.yml",
@@ -562,5 +563,6 @@ fn platform_product(platform: Platform) -> &'static str {
     match platform {
         Platform::Windows => "windows",
         Platform::Linux => "linux",
+        Platform::MacOS => "macos",
     }
 }
