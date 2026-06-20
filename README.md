@@ -35,17 +35,17 @@
 Rustinel ships release archives with a binary, default config, demo rules, and a
 `logs/` directory.
 
-**Linux**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Karib0u/rustinel/main/scripts/install/install.sh | sh -s -- --run
-```
-
 **Windows** - from an elevated PowerShell:
 
 ```powershell
 Invoke-WebRequest https://raw.githubusercontent.com/Karib0u/rustinel/main/scripts/install/install.ps1 -OutFile install-rustinel.ps1
 powershell -ExecutionPolicy Bypass -File .\install-rustinel.ps1 -Run
+```
+
+**Linux**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Karib0u/rustinel/main/scripts/install/install.sh | sh -s -- --run
 ```
 
 **macOS** (experimental)
@@ -85,7 +85,7 @@ A transparent endpoint detection engine you can read, run, test, and extend.
 - **Detection formats:** Sigma for behavior, YARA for files and memory, IOC matching for hashes, IPs, domains, and path regexes.
 - **Rule reuse:** bring existing Sigma and YARA rules instead of rewriting them into a proprietary format.
 - **SIEM output:** ECS 9.4.0 NDJSON alerts for Elastic, Splunk, and other log pipelines.
-- **Operations:** hot reload for rules and IOCs, optional active response on Windows and Linux, Windows service support, and launchd packaging notes.
+- **Operations:** hot reload for rules and IOCs, optional active response on Windows and Linux only; macOS is detection-only today. Includes Windows service support and launchd packaging notes.
 
 ---
 
