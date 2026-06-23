@@ -141,15 +141,23 @@ pub fn spawn_reload_worker(
                         match engine.load_rules(&scanner_cfg.sigma_rules_path) {
                             Ok(()) => {
                                 let stats = engine.stats();
-                                if stats.total_rules == 0 {
+                                if stats.rule_files_found > 0 && stats.total_rules == 0 {
                                     warn!(
                                         target: "reload",
                                         path = ?scanner_cfg.sigma_rules_path,
-                                        "Rejected Sigma reload: compiled ruleset is empty"
+                                        errors = ?stats.failed_rules,
+                                        "Rejected Sigma reload: all found rule files are broken"
                                     );
                                     continue;
                                 }
-
+                                if !stats.failed_rules.is_empty() {
+                                    warn!(
+                                        target: "reload",
+                                        path = ?scanner_cfg.sigma_rules_path,
+                                        errors = ?stats.failed_rules,
+                                        "Some Sigma rules failed to compile, but loading the working rules"
+                                    );
+                                }
                                 store.swap_sigma(Arc::new(engine));
                                 info!(
                                     target: "reload",
@@ -179,15 +187,22 @@ pub fn spawn_reload_worker(
                         match scanner::Scanner::new(&scanner_cfg.yara_rules_path) {
                             Ok(compiled) => {
                                 let compiled_files = compiled.compiled_files();
-                                if compiled_files == 0 {
+                                if compiled.files_found() > 0 && compiled_files == 0 {
                                     warn!(
                                         target: "reload",
                                         path = ?scanner_cfg.yara_rules_path,
-                                        "Rejected YARA reload: compiled file count is zero"
+                                        "Rejected YARA reload: all found rule files are broken"
                                     );
                                     continue;
                                 }
-
+                                if compiled.failed_files() > 0 {
+                                    warn!(
+                                        target: "reload",
+                                        path = ?scanner_cfg.yara_rules_path,
+                                        failed = compiled.failed_files(),
+                                        "Some YARA rules failed to compile, but loading the working rules"
+                                    );
+                                }
                                 store.swap_yara(Arc::new(compiled));
                                 info!(
                                     target: "reload",
@@ -263,13 +278,16 @@ pub fn spawn_reload_poller(
     reload_cfg: ReloadConfig,
     reload_tx: mpsc::UnboundedSender<ReloadTarget>,
 ) -> tokio::task::JoinHandle<()> {
+    use notify::Watcher;
+
     tokio::spawn(async move {
         if !reload_cfg.enabled {
             return;
         }
 
-        let poll_ms = reload_cfg.debounce_ms.max(2000);
-        let interval = Duration::from_millis(poll_ms);
+        let mut watcher_setup_ok = true;
+        let (tx, mut rx) = mpsc::channel::<()>(100);
+        let mut watcher = None;
 
         let mut sigma_fp = scanner_cfg
             .sigma_enabled
@@ -279,14 +297,96 @@ pub fn spawn_reload_poller(
             .then(|| fingerprint_dir(&scanner_cfg.yara_rules_path, &["yar", "yara"]));
         let mut ioc_fp = ioc_cfg.enabled.then(|| fingerprint_ioc_files(&ioc_cfg));
 
+        match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+            if res.is_ok() {
+                let _ = tx.blocking_send(());
+            }
+        }) {
+            Ok(mut w) => {
+                let mut watch_targets = Vec::new();
+                if scanner_cfg.sigma_enabled {
+                    watch_targets.push((
+                        scanner_cfg.sigma_rules_path.clone(),
+                        notify::RecursiveMode::Recursive,
+                    ));
+                }
+                if scanner_cfg.yara_enabled {
+                    watch_targets.push((
+                        scanner_cfg.yara_rules_path.clone(),
+                        notify::RecursiveMode::Recursive,
+                    ));
+                }
+                if ioc_cfg.enabled {
+                    let mut parents = HashSet::new();
+                    for path in [
+                        &ioc_cfg.hashes_path,
+                        &ioc_cfg.ips_path,
+                        &ioc_cfg.domains_path,
+                        &ioc_cfg.paths_regex_path,
+                    ] {
+                        let normalized = normalize_path(path);
+                        if let Some(parent) = normalized.parent() {
+                            parents.insert(parent.to_path_buf());
+                        }
+                    }
+                    for parent in parents {
+                        watch_targets.push((parent, notify::RecursiveMode::NonRecursive));
+                    }
+                }
+
+                for (path, mode) in &watch_targets {
+                    if let Err(e) = w.watch(path, *mode) {
+                        warn!(
+                            target: "reload",
+                            path = ?path,
+                            error = %e,
+                            "Failed to watch path, inotify/watcher setup failed"
+                        );
+                        watcher_setup_ok = false;
+                        break;
+                    }
+                }
+                if watcher_setup_ok {
+                    watcher = Some(w);
+                }
+            }
+            Err(e) => {
+                warn!(
+                    target: "reload",
+                    error = %e,
+                    "Failed to initialize recommended watcher"
+                );
+                watcher_setup_ok = false;
+            }
+        }
+
+        if !watcher_setup_ok {
+            warn!(target: "reload", "inotify is not available for the rules directory");
+        }
+
+        let debounce_interval = Duration::from_millis(reload_cfg.debounce_ms);
+        let poll_interval = Duration::from_millis(reload_cfg.fallback_poll_interval_ms);
+
         info!(
             target: "reload",
-            poll_ms = poll_ms,
-            "Hot-reload poller started"
+            watcher_active = watcher_setup_ok,
+            "Hot-reload poller/watcher started"
         );
 
         loop {
-            tokio::time::sleep(interval).await;
+            if watcher_setup_ok {
+                // Wait for filesystem event
+                if rx.recv().await.is_none() {
+                    break; // channel closed
+                }
+                // Debounce: sleep to let multiple events coalesce
+                tokio::time::sleep(debounce_interval).await;
+                // Drain extra events
+                while rx.try_recv().is_ok() {}
+            } else {
+                // Fallback: poll every 60 seconds
+                tokio::time::sleep(poll_interval).await;
+            }
 
             if scanner_cfg.sigma_enabled {
                 let next = fingerprint_dir(&scanner_cfg.sigma_rules_path, &["yml", "yaml"]);
@@ -319,6 +419,7 @@ pub fn spawn_reload_poller(
             }
         }
 
+        drop(watcher);
         info!(target: "reload", "Hot-reload poller shutting down");
     })
 }
